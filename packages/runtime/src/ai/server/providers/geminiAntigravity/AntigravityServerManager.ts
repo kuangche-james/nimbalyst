@@ -375,10 +375,11 @@ export class AntigravityServerManager {
   async getAvailableModels(ep?: AntigravityEndpoint): Promise<Map<string, AntigravityModelInfo>> {
     const endpoint = ep ?? (await this.ensureRunning());
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const data = await this.rpc<{ response?: { models?: Record<string, any> } }>(
+    const data = await this.rpc<{ response?: { models?: Record<string, any>; tieredModelIds?: any } }>(
       'GetAvailableModels', {}, endpoint, 30_000);
-    const models = data.response?.models ?? {};
     const out = new Map<string, AntigravityModelInfo>();
+
+    const models = data.response?.models ?? {};
     for (const [key, v] of Object.entries(models)) {
       out.set(key, {
         key,
@@ -389,12 +390,31 @@ export class AntigravityServerManager {
         maxOutputTokens: v.maxOutputTokens,
       });
     }
+
+    const tiered = data.response?.tieredModelIds;
+    if (Array.isArray(tiered)) {
+      for (const rawId of tiered) {
+        if (typeof rawId === 'string' && rawId && !out.has(rawId)) {
+          out.set(rawId, { key: rawId, enum: rawId, displayName: '' });
+        }
+      }
+    } else if (tiered && typeof tiered === 'object') {
+      for (const rawList of Object.values(tiered as Record<string, unknown>)) {
+        if (!Array.isArray(rawList)) continue;
+        for (const rawId of rawList) {
+          if (typeof rawId === 'string' && rawId && !out.has(rawId)) {
+            out.set(rawId, { key: rawId, enum: rawId, displayName: '' });
+          }
+        }
+      }
+    }
+
     return out;
   }
 
   /**
    * Resolve a stable model KEY (or displayName) to the server's current enum.
-   * Cached per endpoint. Throws if not found.
+   * Cached per endpoint. Throws if not found in a populated catalog.
    */
   async resolveModelEnum(keyOrDisplayName: string, ep?: AntigravityEndpoint): Promise<string> {
     const cached = this.enumCache.get(keyOrDisplayName);
@@ -403,15 +423,21 @@ export class AntigravityServerManager {
     const catalog = await this.getAvailableModels(endpoint);
 
     const byKey = catalog.get(keyOrDisplayName);
-    if (byKey?.enum) {
-      this.enumCache.set(keyOrDisplayName, byKey.enum);
-      return byKey.enum;
+    if (byKey) {
+      const resolved = byKey.enum || byKey.key;
+      this.enumCache.set(keyOrDisplayName, resolved);
+      return resolved;
     }
     for (const info of catalog.values()) {
-      if (info.displayName.toLowerCase() === keyOrDisplayName.toLowerCase() && info.enum) {
-        this.enumCache.set(keyOrDisplayName, info.enum);
-        return info.enum;
+      if (info.displayName && info.displayName.toLowerCase() === keyOrDisplayName.toLowerCase()) {
+        const resolved = info.enum || info.key;
+        this.enumCache.set(keyOrDisplayName, resolved);
+        return resolved;
       }
+    }
+    if (catalog.size === 0) {
+      this.enumCache.set(keyOrDisplayName, keyOrDisplayName);
+      return keyOrDisplayName;
     }
     throw new Error(
       `Antigravity model ${keyOrDisplayName} not found; available keys: ` +
@@ -507,8 +533,7 @@ export class AntigravityServerManager {
     const binary = AntigravityServerManager.binaryPath();
     if (!fs.existsSync(binary)) {
       throw new Error(
-        `Antigravity language server not found at ${binary}. Install Antigravity or ` +
-        `open the Antigravity IDE.`);
+        `Antigravity language server not found at ${binary}. Install Antigravity from https://antigravity.google/download.`);
     }
 
     const csrf = `nimbalyst-${randomUUID()}`;
@@ -565,10 +590,16 @@ export class AntigravityServerManager {
         await delay(500);
       }
 
-      if (!bindFailed && child.exitCode === null) {
+      if (!bindFailed) {
         this.stop();
+        if (child.exitCode === null) {
+          throw new Error(
+            `Antigravity language server did not become healthy on port ${port} within 60s`,
+          );
+        }
+        const crashReason = bindErrors[bindErrors.length - 1]?.reason ?? `exit code ${child.exitCode}`;
         throw new Error(
-          `Antigravity language server did not become healthy on port ${port} within 60s`,
+          `Antigravity language server exited early on port ${port}: ${crashReason.split('\n')[0]}`,
         );
       }
     }

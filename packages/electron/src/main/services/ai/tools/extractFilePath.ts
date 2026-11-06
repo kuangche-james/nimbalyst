@@ -12,6 +12,8 @@ const FILE_PATH_FIELDS = [
   'file_path',
   'filePath',
   'path',
+  'Path',
+  'TargetFile',
   'targetFilePath',
   'notebook_path',
   'notebookPath',

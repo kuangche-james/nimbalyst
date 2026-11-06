@@ -348,6 +348,13 @@ export abstract class HeadlessCliAgentProvider extends BaseAgentProvider {
           throw new Error('Operation cancelled');
         }
 
+        if (sessionId && session.id && session.id !== existingSessionId) {
+          this.sessions.captureSessionId(sessionId, session.id);
+        }
+        if (session.appliedModel && this._initData) {
+          this._initData.model = session.appliedModel;
+        }
+
         if (sessionId) {
           try {
             await this.storeRawEventIfPresent(event, sessionId);
@@ -599,7 +606,7 @@ export abstract class HeadlessCliAgentProvider extends BaseAgentProvider {
 function readRawEventType(rawEvent: unknown): string {
   if (rawEvent && typeof rawEvent === 'object') {
     const record = rawEvent as Record<string, unknown>;
-    for (const key of ['type', 'method'] as const) {
+    for (const key of ['type', 'method', 'event'] as const) {
       const value = record[key];
       if (typeof value === 'string' && value.trim()) return value;
     }

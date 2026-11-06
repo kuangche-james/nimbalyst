@@ -34,6 +34,7 @@ import { execFile } from 'child_process';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
+import { GeminiAntigravityProvider } from '@nimbalyst/runtime/ai/server/providers/GeminiAntigravityProvider';
 import { AntigravityServerManager } from '@nimbalyst/runtime/ai/server/providers/geminiAntigravity/AntigravityServerManager';
 import { scrubProviderApiKeys } from '@nimbalyst/runtime/ai/server/providerApiKeyScrub';
 
@@ -68,7 +69,7 @@ interface CliProbeSpec {
 interface VendorAppProbeSpec {
   kind: 'vendor-app';
   /** Candidate absolute paths, resolved per platform at probe time. */
-  resolvePath: () => string;
+  resolvePath: (pathValue?: string) => string;
 }
 
 type AgentProbeSpec = CliProbeSpec | VendorAppProbeSpec;
@@ -90,7 +91,9 @@ const PROBE_SPECS: Readonly<Record<HeadlessAgentId, AgentProbeSpec>> = Object.fr
   },
   'antigravity-gemini-agent': {
     kind: 'vendor-app' as const,
-    resolvePath: () => AntigravityServerManager.binaryPath(),
+    resolvePath: (pathValue?: string) =>
+      GeminiAntigravityProvider.resolveAgyExecutablePath(pathValue) ??
+      AntigravityServerManager.binaryPath(),
   },
 });
 
@@ -138,7 +141,7 @@ export function decideAvailability(
 function findExecutable(spec: AgentProbeSpec, pathValue: string | undefined): string | undefined {
   if (spec.kind === 'vendor-app') {
     try {
-      const resolved = spec.resolvePath();
+      const resolved = spec.resolvePath(pathValue);
       return fs.existsSync(resolved) ? resolved : undefined;
     } catch {
       return undefined;

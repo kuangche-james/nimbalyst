@@ -62,8 +62,8 @@ export function GeminiPanel({ config, onToggle }: GeminiPanelProps) {
           <AlphaBadge size="sm" tooltip={SETTINGS_ALPHA_TOOLTIP} />
         </h3>
         <p className="provider-panel-description text-sm leading-relaxed text-[var(--nim-text-muted)]">
-          Google&apos;s Gemini models, run through the language server that ships inside
-          Antigravity. Uses the account you are already signed into there.
+          Google&apos;s Gemini models, run through the official Antigravity CLI (<code>agy</code>).
+          Uses the Google account you are already signed into there.
         </p>
       </div>
 

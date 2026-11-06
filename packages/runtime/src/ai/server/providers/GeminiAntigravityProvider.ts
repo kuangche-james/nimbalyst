@@ -1,42 +1,25 @@
 /**
- * Gemini agent provider, backed by the Antigravity language server.
+ * Gemini agent provider, backed by the official Antigravity CLI (`agy`).
  *
- * Not a `HeadlessCliAgentProvider` subclass. That base assumes one process per
- * turn streaming NDJSON on stdout; Antigravity is a long-lived local server
- * addressed over Connect-RPC, whose single relevant call --
- * `GetModelResponse({prompt, model}) -> {response}` -- is stateless, buffered,
- * and has no function-calling surface. `AntigravityToolLoopProtocol` supplies
- * the tool loop the transport lacks; this class is the host-facing half.
+ * Subclasses `HeadlessCliAgentProvider` and drives `agy --print --output-format stream-json`
+ * via `AgyCliProtocol` — the same headless per-turn NDJSON architecture used by
+ * `CursorAgentProvider`.
  *
- * Three consequences of that transport, each declared rather than assumed:
- *
- *   - **No provider session id.** The server keeps nothing between calls, so
- *     the whole conversation is re-rendered into one flat prompt per turn from
- *     the host's own message history. `getProviderSessionData` has nothing to
- *     return, and resuming a session is just re-seeding the loop.
- *   - **No usage numbers.** The response envelope carries only `response`.
- *     `contextReporting: 'none'` in `agentCapabilities.ts` follows from that --
- *     a percentage drawn from a token count we do not have would be a lying 0%
- *     (#914). Quota lives on a separate account-level RPC; see
- *     `AntigravityUsageMeter`.
- *   - **`'tool-args'` file fidelity, not `'structured'`.** Nimbalyst performs
- *     Gemini's writes itself, so an exact pre-edit baseline is free and this
- *     provider emits authoritative pre/post edit snapshots. It still stops
- *     short of `'structured'` because the toolset has no delete and no move:
- *     every removal is an opaque `rm` inside `run_command`. Declaring
- *     `'structured'` would switch the filesystem watcher off and make those
- *     removals vanish from the Files Edited sidebar. Same reasoning as
- *     `grok-build`, whose toolset is identical in this respect.
- *
- * Auth rides the user's existing Antigravity login. Nimbalyst stores no key for
- * it and reads no environment variable. That login is NOT on disk under
- * `~/.gemini` (which holds only onboarding state and config) -- on macOS it is
- * in the keychain, service `gemini`, account `antigravity`. Which is why
- * detection can answer "installed" but not "signed in"; see
- * `headlessAgentAvailability.ts`.
+ * Also retains the legacy `AntigravityServerManager` / `AntigravityToolLoopProtocol`
+ * fallback when a host tool executor is explicitly injected for unit tests.
  */
 
-import { BaseAgentProvider } from './BaseAgentProvider';
+import { existsSync } from 'fs';
+import * as os from 'os';
+import * as path from 'path';
+import {
+  HeadlessCliAgentProvider,
+  type HeadlessCliAgentDescriptor,
+  type HeadlessCliEnvironmentLoaders,
+  buildHeadlessChildEnvironment,
+} from './HeadlessCliAgentProvider';
+import { AgyCliProtocol } from '../protocols/AgyCliProtocol';
+import type { ProtocolEvent, ToolResult } from '../protocols/ProtocolInterface';
 import { appendSessionDirective } from '../../prompt';
 import {
   AntigravityServerManager,
@@ -47,8 +30,9 @@ import {
   DEFAULT_GEMINI_MODEL_KEY,
   bareGeminiModelKey,
   discoverGeminiModels,
+  parseAgyModelList,
 } from './geminiAntigravity/geminiAntigravityModels';
-import type { ProviderSessionData } from './ProviderSessionManager';
+import type { MCPServerConfig } from '../../../types/MCPServerConfig';
 import type {
   AgentToolDefinition,
   AIModel,
@@ -58,24 +42,14 @@ import type {
   Message,
   ProviderConfig,
   StreamChunk,
-  ToolHandler,
 } from '../types';
 
 export const GEMINI_ANTIGRAVITY_PROVIDER: AIProviderType = 'antigravity-gemini-agent';
 
-/**
- * Outcome of a host-executed tool call.
- *
- * `text` is what the model sees. `fileWrite` is present only when the call
- * actually wrote a file, and carries the content read immediately before the
- * write -- the baseline no watcher or snapshot cache can beat, because nothing
- * ran between the read and the write.
- */
 export interface GeminiToolExecutionResult {
   text: string;
   fileWrite?: {
     absPath: string;
-    /** `null` when the file did not exist -- a create, not an update. */
     beforeContent: string | null;
     afterContent: string;
   };
@@ -90,7 +64,6 @@ export interface GeminiToolExecutorArgs {
 
 export type GeminiToolExecutor = (args: GeminiToolExecutorArgs) => Promise<GeminiToolExecutionResult>;
 
-/** Server tuning the Electron main process reads out of settings. */
 export interface GeminiServerConfig {
   overrideIdeVersion?: string;
   spawnPortCandidates?: number[];
@@ -104,8 +77,6 @@ interface SessionState {
   abortController: AbortController | null;
 }
 
-// run_command tuning. The command runs in this process with the session's
-// workspace as cwd, bounded by a hard timeout and output caps.
 const RUN_COMMAND_TIMEOUT_MS = 120_000;
 const RUN_COMMAND_MAX_BUFFER = 4 * 1024 * 1024;
 const RUN_COMMAND_MAX_OUTPUT = 48_000;
@@ -116,46 +87,93 @@ function clampCommandOutput(text: string): string {
     : `${text.slice(0, RUN_COMMAND_MAX_OUTPUT)}\n\n[output truncated at ${RUN_COMMAND_MAX_OUTPUT} characters]`;
 }
 
-export class GeminiAntigravityProvider extends BaseAgentProvider {
+const DESCRIPTOR: HeadlessCliAgentDescriptor = {
+  providerName: GEMINI_ANTIGRAVITY_PROVIDER,
+  displayName: 'Antigravity',
+  description: 'Gemini via Google Antigravity CLI (agy), driven headlessly over stream JSON',
+  executableName: process.platform === 'win32' ? 'agy.exe' : 'agy',
+  homeRelativeInstallPaths: [
+    'AppData/Local/agy/bin/agy.exe',
+    'AppData/Local/agy/agy.exe',
+    '.local/bin/agy',
+    '.gemini/antigravity-cli/bin/agy',
+  ],
+  notInstalledMessage:
+    'Antigravity CLI (agy) is not installed or not in PATH. Install Antigravity from https://antigravity.google/download, ensure `agy` is on your PATH, and try again.',
+  notLoggedInMessage:
+    'Antigravity is not logged in. Run `agy` or open Antigravity to sign in to your Google account, then try again.',
+  supportsToolPermissions: false,
+  permissionModeMessage:
+    'Gemini via Antigravity CLI runs in headless --print mode, which executes tools without interactive prompts. Switch workspace permission mode to "Allow all" (or "Bypass all") to use Gemini in this workspace.',
+};
+
+export class GeminiAntigravityProvider extends HeadlessCliAgentProvider {
+  static readonly DEFAULT_MODEL = `${GEMINI_ANTIGRAVITY_PROVIDER}:${DEFAULT_GEMINI_MODEL_KEY}`;
+
+  static readonly NOT_INSTALLED_MESSAGE = DESCRIPTOR.notInstalledMessage;
+  static readonly NOT_SIGNED_IN_MESSAGE = DESCRIPTOR.notLoggedInMessage;
+  static readonly VERSION_GATE_MESSAGE =
+    'Antigravity rejected this build as out of date. Update Antigravity to its '
+    + 'latest version and try again. (If you need to keep the current version, '
+    + 'set a newer `overrideIdeVersion` on the Gemini provider in ai-settings.)';
+
+  protected readonly descriptor = DESCRIPTOR;
+  protected readonly protocol: AgyCliProtocol;
+
+  private static mcpConfigLoader:
+    | ((workspacePath?: string) => Promise<Record<string, MCPServerConfig>>)
+    | null = null;
+  private static shellEnvironmentLoader: (() => Record<string, string> | null) | null = null;
+  private static enhancedPathLoader: (() => string) | null = null;
+  private static agyPathLoader: (() => string | null) | null = null;
+
   private static toolExecutor: GeminiToolExecutor | null = null;
   private static serverConfigLoader: (() => GeminiServerConfig) | null = null;
 
   private readonly sessionStates = new Map<string, SessionState>();
   private readonly server: AntigravityServerManager;
+  private readonly explicitServer: boolean;
 
-  constructor(deps?: { server?: AntigravityServerManager }) {
-    super();
+  constructor(deps?: { protocol?: AgyCliProtocol; server?: AntigravityServerManager }) {
+    super(GeminiAntigravityProvider.loaders());
+    this.protocol = deps?.protocol ?? new AgyCliProtocol();
     this.server = deps?.server ?? AntigravityServerManager.shared();
+    this.explicitServer = Boolean(deps?.server);
   }
 
-  getProviderName(): AIProviderType {
-    return GEMINI_ANTIGRAVITY_PROVIDER;
+  private static loaders(): HeadlessCliEnvironmentLoaders {
+    return {
+      mcpConfigLoader: GeminiAntigravityProvider.mcpConfigLoader,
+      shellEnvironmentLoader: GeminiAntigravityProvider.shellEnvironmentLoader,
+      enhancedPathLoader: GeminiAntigravityProvider.enhancedPathLoader,
+      executablePathLoader: GeminiAntigravityProvider.agyPathLoader,
+    };
   }
 
-  async initialize(config: ProviderConfig): Promise<void> {
-    this.config = config;
-    // Apply configuration but do NOT start the server: spawning is deferred to
-    // the first real turn, so opening settings or a model picker never fires up
-    // a ~120MB language server.
+  protected getLoaders(): HeadlessCliEnvironmentLoaders {
+    return GeminiAntigravityProvider.loaders();
+  }
+
+  protected configureProtocol(executablePath: string, env: Record<string, string>): void {
+    this.protocol.setAgyPath(executablePath);
+    this.protocol.setProcessEnv(env);
+  }
+
+  protected getDefaultModelId(): string {
+    return GeminiAntigravityProvider.DEFAULT_MODEL;
+  }
+
+  static getDefaultModel(): string {
+    return GeminiAntigravityProvider.DEFAULT_MODEL;
+  }
+
+  override async initialize(config: ProviderConfig): Promise<void> {
+    await super.initialize(config);
     const serverConfig = GeminiAntigravityProvider.serverConfigLoader?.();
     if (serverConfig) this.server.configure(serverConfig);
   }
 
-  /**
-   * Nothing to return: the language server holds no session state, so there is
-   * no provider-side id to persist alongside the Nimbalyst session row.
-   */
-  getProviderSessionData(_sessionId: string): ProviderSessionData | null {
-    return null;
-  }
-
-  registerToolHandler(_handler: ToolHandler): void {
-    // Tools are executed through the injected `toolExecutor` (host-side, with
-    // the workspace jail the host owns), not through the runtime tool-handler
-    // surface. Kept so the class satisfies `AIProvider`.
-  }
-
-  abort(): void {
+  override abort(): void {
     for (const state of this.sessionStates.values()) {
       state.abortController?.abort();
       state.toolLoop.abort();
@@ -163,13 +181,104 @@ export class GeminiAntigravityProvider extends BaseAgentProvider {
     super.abort();
   }
 
-  destroy(): void {
+  override destroy(): void {
     this.abort();
     this.sessionStates.clear();
     super.destroy();
   }
 
-  async *sendMessage(
+  /**
+   * Emit authoritative `pre_edit_snapshot` / `post_edit_snapshot` chunks when
+   * `AgyCliProtocol` attaches full-file `changes` onto an edit tool result,
+   * while keeping `getFileChangeFidelity() === 'tool-args'` so the filesystem
+   * watcher remains active for shell-driven deletes and moves.
+   */
+  protected override *buildEditSnapshots(event: ProtocolEvent): Generator<StreamChunk> {
+    if (event.type !== 'tool_result') return;
+
+    const result = event.toolResult?.result;
+    if (!result || typeof result === 'string') return;
+    const changes = (result as ToolResult).changes;
+    if (!Array.isArray(changes) || changes.length === 0) return;
+
+    const toolUseId = event.toolResult?.id ?? `${this.getProviderName()}-edit-${changes.length}`;
+    const preEntries: Array<{ path: string; content: string; kind?: string }> = [];
+    const postEntries: Array<{ path: string; content: string; kind?: string }> = [];
+
+    for (const raw of changes) {
+      const change = raw as {
+        path?: unknown;
+        kind?: unknown;
+        beforeContent?: unknown;
+        afterContent?: unknown;
+      };
+      if (typeof change.path !== 'string' || !change.path) continue;
+      const kind = typeof change.kind === 'string' ? change.kind : 'update';
+
+      if (typeof change.beforeContent === 'string') {
+        preEntries.push({ path: change.path, content: change.beforeContent, kind });
+      }
+      if (kind !== 'delete' && typeof change.afterContent === 'string') {
+        postEntries.push({ path: change.path, content: change.afterContent, kind });
+      }
+    }
+
+    if (preEntries.length > 0) {
+      yield {
+        type: 'pre_edit_snapshot',
+        preEditSnapshot: {
+          toolUseId,
+          entries: preEntries,
+          authoritative: true,
+        },
+      };
+    }
+    if (postEntries.length > 0) {
+      yield {
+        type: 'post_edit_snapshot',
+        postEditSnapshot: {
+          toolUseId,
+          entries: postEntries,
+        },
+      };
+    }
+  }
+
+  override async *sendMessage(
+    message: string,
+    documentContext?: DocumentContext,
+    sessionId?: string,
+    messages?: Message[],
+    workspacePath?: string,
+    attachments?: ChatAttachment[],
+    tools?: AgentToolDefinition[],
+    systemPrompt?: string,
+  ): AsyncIterableIterator<StreamChunk> {
+    if (GeminiAntigravityProvider.toolExecutor !== null || this.explicitServer) {
+      yield* this.sendMessageViaServerManager(
+        message,
+        documentContext,
+        sessionId,
+        messages,
+        workspacePath,
+        attachments,
+        tools,
+        systemPrompt,
+      );
+      return;
+    }
+
+    yield* super.sendMessage(
+      message,
+      documentContext,
+      sessionId,
+      messages,
+      workspacePath,
+      attachments,
+    );
+  }
+
+  private async *sendMessageViaServerManager(
     message: string,
     documentContext?: DocumentContext,
     sessionId?: string,
@@ -184,23 +293,24 @@ export class GeminiAntigravityProvider extends BaseAgentProvider {
       return;
     }
 
-    // The host hands a tool-loop provider its whole system prompt (persona) and
-    // does not include the session directive; it is appended here, frozen.
-    const turnSystemPrompt = appendSessionDirective(systemPrompt ?? '', await this.getSessionDirective(sessionId));
+    const turnSystemPrompt = appendSessionDirective(
+      systemPrompt ?? '',
+      await this.getSessionDirective(sessionId),
+    );
 
     const state = this.resolveSession(sessionId, workspacePath, documentContext);
     const abortController = new AbortController();
     state.abortController = abortController;
     this.abortController = abortController;
 
-    // Re-seed the loop from the host's canonical history. The turn's own user
-    // message is appended by run(), so a trailing duplicate of it is dropped
-    // rather than sent twice.
     if (messages && messages.length > 0) {
       const prior = [...messages];
       const last = prior[prior.length - 1];
-      if (last?.role === 'user' && typeof last.content === 'string'
-        && last.content.trim() === message.trim()) {
+      if (
+        last?.role === 'user' &&
+        typeof last.content === 'string' &&
+        last.content.trim() === message.trim()
+      ) {
         prior.pop();
       }
       state.toolLoop.seedHistory(prior);
@@ -218,11 +328,10 @@ export class GeminiAntigravityProvider extends BaseAgentProvider {
     let finalText = '';
     let sawText = false;
     let toolCallSeq = 0;
-    // The tool loop reports a call and its result as two separate steps keyed
-    // only by tool name, so the id minted on the call is held here until the
-    // matching result arrives. It becomes the chunk's `toolUseId`, which is
-    // what file attribution and pre-edit history tags correlate on.
-    const pendingCalls = new Map<string, { id: string; name: string; args: Record<string, unknown> }>();
+    const pendingCalls = new Map<
+      string,
+      { id: string; name: string; args: Record<string, unknown> }
+    >();
 
     try {
       for await (const step of state.toolLoop.run(
@@ -242,17 +351,9 @@ export class GeminiAntigravityProvider extends BaseAgentProvider {
         } else if (step.type === 'tool_result') {
           const pending = pendingCalls.get(step.name);
           if (!pending) {
-            // No id to attribute a write to. Drop any buffered snapshot rather
-            // than letting it ride along to the NEXT tool's id, which would
-            // pin one tool's file change onto an unrelated call in the diff
-            // view. Losing the snapshot degrades to watcher attribution;
-            // mis-attributing it is a wrong answer stated confidently.
             this.pendingEditSnapshots.length = 0;
             continue;
           }
-          // Emit the edit snapshots BEFORE the terminal tool_call chunk. That
-          // chunk closes the attribution window, and a snapshot arriving after
-          // it would tag a file the host has stopped associating with the call.
           for (const snapshot of this.drainEditSnapshots(pending.id)) {
             yield snapshot;
           }
@@ -260,11 +361,6 @@ export class GeminiAntigravityProvider extends BaseAgentProvider {
             sessionId,
             'output',
             JSON.stringify({ name: step.name, result: step.result, args: pending.args }),
-            // `toolUseId` is what makes a reloaded transcript agree with the
-            // live one: without it the parser has to mint a synthetic id, and
-            // the reloaded tool card is a different event from the streamed
-            // one. Rows written before this existed have none, which is why
-            // `GeminiAntigravityRawParser` still has a synthetic fallback.
             { metadata: { role: 'tool', timestamp: Date.now(), toolUseId: pending.id } },
           );
           yield {
@@ -280,16 +376,17 @@ export class GeminiAntigravityProvider extends BaseAgentProvider {
         } else if (step.type === 'text') {
           finalText = step.content;
           sawText = true;
-          // Always surface something: an empty assistant turn would otherwise
-          // leave the transcript with no assistant message at all for the turn.
           yield {
             type: 'text',
             content: finalText.trim().length === 0 ? '(model returned no text)' : finalText,
           };
         } else if (step.type === 'complete') {
-          const persisted = finalText.trim().length === 0
-            ? (sawText ? '(model returned no text)' : '(no model response)')
-            : finalText;
+          const persisted =
+            finalText.trim().length === 0
+              ? sawText
+                ? '(model returned no text)'
+                : '(no model response)'
+              : finalText;
           await this.logAgentMessageBestEffort(sessionId, 'output', persisted, {
             metadata: { role: 'assistant', timestamp: Date.now(), model: state.modelKey },
           });
@@ -302,11 +399,6 @@ export class GeminiAntigravityProvider extends BaseAgentProvider {
       if (/not found at |Install Antigravity/i.test(errorMessage)) {
         yield { type: 'error', error: GeminiAntigravityProvider.NOT_INSTALLED_MESSAGE };
       } else if (error instanceof AntigravityVersionGateError) {
-        // The server enforces a supported-build floor and Antigravity has
-        // raised it. The underlying message names the flag, which is no use to
-        // anyone; say what to actually do. Updating Antigravity is the fix, and
-        // the settings key is the escape hatch for someone who cannot wait for
-        // a Nimbalyst release.
         yield { type: 'error', error: GeminiAntigravityProvider.VERSION_GATE_MESSAGE };
       } else if (/not logged in|unauthorized|forbidden|HTTP 401|HTTP 403/i.test(errorMessage)) {
         yield {
@@ -324,14 +416,6 @@ export class GeminiAntigravityProvider extends BaseAgentProvider {
     }
   }
 
-  // --- Tool execution ------------------------------------------------------
-
-  /**
-   * Edit snapshots produced by the current turn's writes, drained onto the
-   * stream when the write's tool result comes back. Buffered rather than
-   * yielded inline because the executor is a plain callback the tool loop
-   * awaits -- it has no channel back onto the generator.
-   */
   private readonly pendingEditSnapshots: Array<{
     beforeContent: string | null;
     afterContent: string;
@@ -360,17 +444,6 @@ export class GeminiAntigravityProvider extends BaseAgentProvider {
     return result.text;
   }
 
-  /**
-   * Turn this turn's buffered writes into the pre/post snapshot chunks
-   * `MessageStreamingHandler` writes as local-history entries.
-   *
-   * `authoritative: true` is earned, not asserted: `beforeContent` was read
-   * inside the write path microseconds before the write, so a FileSnapshotCache
-   * lookup at this point can only be staler. A `null` before-content means the
-   * file did not exist, and an empty-string baseline is the correct one for a
-   * create -- unlike the `'structured'` providers, which must skip the entry
-   * because they cannot distinguish "no baseline recorded" from "empty file".
-   */
   private *drainEditSnapshots(toolUseId: string): Generator<StreamChunk> {
     if (this.pendingEditSnapshots.length === 0) return;
     const writes = this.pendingEditSnapshots.splice(0, this.pendingEditSnapshots.length);
@@ -399,18 +472,6 @@ export class GeminiAntigravityProvider extends BaseAgentProvider {
     };
   }
 
-  /**
-   * Run a shell command in the session's workspace and return stdout/stderr/exit
-   * code as text for the model. Bounded by a timeout and output caps; cwd is
-   * pinned to the workspace so a bare relative path cannot escape it.
-   *
-   * Unlike the other tools this does not go through the host executor, because
-   * it needs nothing the host owns beyond a working directory. Note it runs
-   * from Nimbalyst's own process rather than the extension utility process it
-   * used to live in -- `exec` is async and the child is what dies on a bad
-   * command, so a runaway cannot block the event loop, but the timeout and the
-   * output caps are what keep it bounded and neither is optional.
-   */
   private async runCommand(
     workspacePath: string | undefined,
     args: Record<string, unknown>,
@@ -437,8 +498,12 @@ export class GeminiAntigravityProvider extends BaseAgentProvider {
       return clampCommandOutput(`$ ${command}\nexit code: 0\n\n${body}`);
     } catch (err: unknown) {
       const e = err as {
-        code?: number; killed?: boolean; signal?: string;
-        stdout?: string; stderr?: string; message?: string;
+        code?: number;
+        killed?: boolean;
+        signal?: string;
+        stdout?: string;
+        stderr?: string;
+        message?: string;
       };
       if (e.killed && e.signal === 'SIGTERM') {
         return clampCommandOutput(
@@ -449,13 +514,11 @@ export class GeminiAntigravityProvider extends BaseAgentProvider {
         `$ ${command}`,
         `exit code: ${typeof e.code === 'number' ? e.code : 'unknown'}`,
         e.stdout ? `stdout:\n${e.stdout}` : '',
-        e.stderr ? `stderr:\n${e.stderr}` : (e.message ? `error: ${e.message}` : ''),
+        e.stderr ? `stderr:\n${e.stderr}` : e.message ? `error: ${e.message}` : '',
       ].filter(Boolean);
       return clampCommandOutput(parts.join('\n\n'));
     }
   }
-
-  // --- Session state -------------------------------------------------------
 
   private resolveSession(
     sessionId: string,
@@ -463,7 +526,7 @@ export class GeminiAntigravityProvider extends BaseAgentProvider {
     documentContext: DocumentContext | undefined,
   ): SessionState {
     const modelKey = bareGeminiModelKey(
-      this.config.model ?? (documentContext as { model?: string } | undefined)?.model,
+      this.config?.model ?? (documentContext as { model?: string } | undefined)?.model,
     );
     const existing = this.sessionStates.get(sessionId);
     if (existing) {
@@ -487,6 +550,24 @@ export class GeminiAntigravityProvider extends BaseAgentProvider {
 
   // --- Static injection (Electron main process, at startup) ----------------
 
+  static setMCPConfigLoader(
+    loader: ((workspacePath?: string) => Promise<Record<string, MCPServerConfig>>) | null,
+  ): void {
+    GeminiAntigravityProvider.mcpConfigLoader = loader;
+  }
+
+  static setShellEnvironmentLoader(loader: (() => Record<string, string> | null) | null): void {
+    GeminiAntigravityProvider.shellEnvironmentLoader = loader;
+  }
+
+  static setEnhancedPathLoader(loader: (() => string) | null): void {
+    GeminiAntigravityProvider.enhancedPathLoader = loader;
+  }
+
+  static setAgyPathLoader(loader: (() => string | null) | null): void {
+    GeminiAntigravityProvider.agyPathLoader = loader;
+  }
+
   static setToolExecutor(executor: GeminiToolExecutor | null): void {
     GeminiAntigravityProvider.toolExecutor = executor;
   }
@@ -497,39 +578,83 @@ export class GeminiAntigravityProvider extends BaseAgentProvider {
 
   // --- Detection and catalog ----------------------------------------------
 
-  static readonly NOT_INSTALLED_MESSAGE =
-    'Antigravity is not installed. Install it from https://antigravity.google, '
-    + 'sign in once, then try again — Nimbalyst uses that login and stores no key of its own.';
+  /** Resolve the `agy` CLI executable path from configured loader, PATH, or standard install paths. */
+  static resolveAgyExecutablePath(enhancedPath?: string): string | undefined {
+    const configured = GeminiAntigravityProvider.agyPathLoader?.();
+    if (configured && existsSync(configured)) return configured;
 
-  static readonly NOT_SIGNED_IN_MESSAGE =
-    'Antigravity is installed but not signed in. Open Antigravity and sign in to '
-    + 'your Google account, then try again.';
+    const searchPath =
+      enhancedPath ?? GeminiAntigravityProvider.enhancedPathLoader?.() ?? process.env.PATH ?? '';
+    for (const dir of searchPath.split(path.delimiter)) {
+      if (!dir) continue;
+      const candidate = path.join(dir, DESCRIPTOR.executableName);
+      if (existsSync(candidate)) return candidate;
+    }
 
-  static readonly VERSION_GATE_MESSAGE =
-    'Antigravity rejected this build as out of date. Update Antigravity to its '
-    + 'latest version and try again. (If you need to keep the current version, '
-    + 'set a newer `overrideIdeVersion` on the Gemini provider in ai-settings.)';
+    const home = os.homedir();
+    for (const rel of DESCRIPTOR.homeRelativeInstallPaths) {
+      const candidate = path.join(home, rel);
+      if (existsSync(candidate)) return candidate;
+    }
+    return undefined;
+  }
 
-  /** True when the Antigravity language server binary is present. */
+  /** True when the Antigravity CLI (`agy`) or language server binary is present. */
   static isInstalled(): boolean {
-    return AntigravityServerManager.isInstalled();
+    return (
+      GeminiAntigravityProvider.resolveAgyExecutablePath() !== undefined ||
+      AntigravityServerManager.isInstalled()
+    );
   }
 
   /** Path the install is expected at, for the settings panel to show. */
   static installPath(): string {
-    return AntigravityServerManager.binaryPath();
-  }
-
-  static getDefaultModel(): string {
-    return `${GEMINI_ANTIGRAVITY_PROVIDER}:${DEFAULT_GEMINI_MODEL_KEY}`;
+    return (
+      GeminiAntigravityProvider.resolveAgyExecutablePath() ??
+      path.join(
+        os.homedir(),
+        process.platform === 'win32' ? 'AppData/Local/agy/bin/agy.exe' : '.local/bin/agy',
+      )
+    );
   }
 
   /**
-   * The model catalog, discovered from the language server when it is already
-   * running and falling back to a short seed list otherwise. See
-   * `geminiAntigravityModels.ts` for why discovery never spawns the server.
+   * Discover the Gemini model catalog via `agy models` (with scrubbed API keys
+   * so only the user's Antigravity CLI login is consulted), falling back to
+   * `discoverGeminiModels` (seed list / running hub) if `agy` is unavailable.
    */
   static async getModels(): Promise<AIModel[]> {
+    const command =
+      GeminiAntigravityProvider.agyPathLoader?.() ??
+      GeminiAntigravityProvider.resolveAgyExecutablePath() ??
+      DESCRIPTOR.executableName;
+    try {
+      const { execFile } = await import('child_process');
+      const output = await new Promise<string>((resolve, reject) => {
+        execFile(
+          command,
+          ['models'],
+          {
+            encoding: 'utf8',
+            timeout: 10_000,
+            windowsHide: true,
+            env: buildHeadlessChildEnvironment(GeminiAntigravityProvider.loaders()),
+          },
+          (error, stdout) => (error ? reject(error) : resolve(stdout)),
+        );
+      });
+      const parsed = parseAgyModelList(output);
+      if (parsed.length > 0) {
+        return parsed.map((m) => ({
+          id: `${GEMINI_ANTIGRAVITY_PROVIDER}:${m.key}`,
+          name: m.displayName,
+          provider: GEMINI_ANTIGRAVITY_PROVIDER,
+        }));
+      }
+    } catch {
+      // Fall through to seed/hub catalog.
+    }
+
     const models = await discoverGeminiModels(AntigravityServerManager.shared());
     return models.map((m) => ({
       id: `${GEMINI_ANTIGRAVITY_PROVIDER}:${m.key}`,

@@ -53,12 +53,16 @@ function getLinkTypeForTool(toolName: string): FileLinkType | null {
     // OpenCode tool names (short names from real SDK: edit, write, patch, shell)
     'file_write', 'file_edit', 'file_create', 'shell', 'patch',
     'edit', 'write', 'create',
+    // Antigravity CLI (`agy`) tool names
+    'write_file', 'edit_file', 'write_to_file', 'replace_file_content', 'multi_replace_file_content', 'run_command',
   ];
   const readTools = [
     'Read', 'Glob', 'Grep', 'readFile', 'searchFiles', 'listFiles', 'getDocumentContent',
     // OpenCode tool names (short names from real SDK: read, list, search)
     'file_read', 'file_list', 'file_search',
     'read', 'list', 'search',
+    // Antigravity CLI (`agy`) tool names
+    'read_file', 'view_file',
   ];
 
   if (editTools.includes(toolName)) {
@@ -98,7 +102,7 @@ function extractEditMetadata(toolName: string, args: any, result: any, filePath?
   };
 
   // Determine operation type
-  if (toolName === 'Write' || toolName === 'writeFile' || toolName === 'file_write' || toolName === 'file_create') {
+  if (toolName === 'Write' || toolName === 'writeFile' || toolName === 'file_write' || toolName === 'file_create' || toolName === 'write_file' || toolName === 'write_to_file') {
     metadata.operation = 'create';
   } else if (toolName === 'ApplyPatch') {
     // Codex apply_patch tells us add/update/delete per-file in args.changes.
@@ -111,9 +115,9 @@ function extractEditMetadata(toolName: string, args: any, result: any, filePath?
     } else {
       metadata.operation = 'edit';
     }
-  } else if (toolName === 'Edit' || toolName === 'editFile' || toolName === 'applyDiff' || toolName === 'file_edit' || toolName === 'patch') {
+  } else if (toolName === 'Edit' || toolName === 'editFile' || toolName === 'applyDiff' || toolName === 'file_edit' || toolName === 'patch' || toolName === 'edit_file' || toolName === 'replace_file_content' || toolName === 'multi_replace_file_content') {
     metadata.operation = 'edit';
-  } else if (toolName === 'Bash' || toolName === 'shell') {
+  } else if (toolName === 'Bash' || toolName === 'shell' || toolName === 'run_command') {
     // For Bash/shell, store the command for reference
     metadata.operation = 'bash';
     if (args?.command) {
@@ -281,7 +285,7 @@ export class SessionFileTracker {
       // Bash/shell commands are intentionally not parsed for file operations.
       // Watcher-based attribution is responsible for detecting and attributing
       // file edits caused by shell commands.
-      if (toolName === 'Bash' || toolName === 'shell') {
+      if (toolName === 'Bash' || toolName === 'shell' || toolName === 'run_command') {
         const rawCommand = args?.command;
         if (!rawCommand || typeof rawCommand !== 'string') {
           logger.main.debug('[SessionFileTracker] No command found in Bash args');
