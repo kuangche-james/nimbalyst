@@ -6,7 +6,7 @@ import { getAgentWorkflowService } from '../../AgentWorkflowService';
 import { safeSend } from '.././aiServiceUtils';
 import { claudeCliSessionSupportsPlugins } from '.././claudeCliLauncherSingleton';
 import { getCachedHeadlessAgentAvailability } from '.././headlessAgentAvailability';
-import { isModelEnabled, resolveProviderEnabled } from '.././modelEnablementFilter';
+import { dropStaleAllowLists, isModelEnabled, resolveProviderEnabled } from '.././modelEnablementFilter';
 import { logger } from '../../../utils/logger';
 import { type AIServiceContext } from './AIServiceContext';
 import { ModelRegistry, ProviderFactory } from '@nimbalyst/runtime/ai/server';
@@ -272,9 +272,20 @@ export function registerModelHandlers(ctx: AIServiceContext): void {
 
     // Filter to only enabled models. The gate is extracted to a pure,
     // unit-tested function so the claude-code family (SDK + CLI) can't silently
-    // hide a shipped variant again (NIM-1486).
+    // hide a shipped variant again (NIM-1486). An allow-list left over from a
+    // catalog that no longer exists would hide the whole provider; it is
+    // ignored instead (#1653).
+    const { entries: effectiveEnablement, stale: staleAllowLists } = dropStaleAllowLists(
+      enabledProviders,
+      allModels,
+    );
+    if (staleAllowLists.length > 0) {
+      logger.ai.warn(
+        `[AIService] ai:getModels ignoring stale model allow-list(s) that match nothing in the current catalog: ${staleAllowLists.join(', ')}`,
+      );
+    }
     const enabledModels = allModels.filter(model =>
-      isModelEnabled(model, enabledProviders[model.provider as AIProviderType]),
+      isModelEnabled(model, effectiveEnablement[model.provider as AIProviderType]),
     );
 
     // Surface extension-contributed agent providers (aiAgentProviders) in the

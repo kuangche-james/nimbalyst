@@ -173,8 +173,12 @@ export function selectGeminiModels(
 }
 
 /**
- * Parse the tabular output of `agy models` (`<id>\s{2,}<Display Name>`) and
- * return Google-served Gemini entries (`gemini-*`).
+ * Parse the tabular output of `agy models` and return Google-served Gemini
+ * entries (`gemini-*`). The CLI separates the id from the display name with a
+ * single tab (`gemini-4-argon-medium\tGemini 4 Argon (Medium)`); older notes
+ * showed two or more spaces, so both are accepted. A pattern that only took
+ * spaces parsed nothing on a real Windows install and fell back to the seed
+ * list on every read (#1653).
  */
 export function parseAgyModelList(
   output: string,
@@ -184,7 +188,7 @@ export function parseAgyModelList(
   for (const rawLine of output.split(/\r?\n/)) {
     const line = rawLine.trim();
     if (!line) continue;
-    const match = /^([a-z0-9][a-z0-9._-]*)\s{2,}(.+?)\s*$/i.exec(line);
+    const match = /^([a-z0-9][a-z0-9._-]*)(?:\t+| {2,})\s*(.+?)\s*$/i.exec(line);
     if (!match) continue;
     const [, key, displayName] = match;
     if (!key.toLowerCase().startsWith('gemini-')) continue;

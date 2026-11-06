@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { CLAUDE_CODE_VARIANTS, ModelIdentifier } from '@nimbalyst/runtime/ai/server/types';
-import { isModelEnabled, resolveProviderEnabled } from '../modelEnablementFilter';
+import { dropStaleAllowLists, isModelEnabled, resolveProviderEnabled, type ProviderEnablement } from '../modelEnablementFilter';
 
 /**
  * The gate that once hid Fable 5 from the picker (NIM-1486). These lock in the
@@ -92,6 +92,57 @@ describe('isModelEnabled', () => {
  * Claude subscription never required it — Claude Agent already runs on the
  * subscription — so an absent setting must mean disabled.
  */
+describe('dropStaleAllowLists', () => {
+  const gemini = 'antigravity-gemini-agent';
+  const catalog = [
+    { id: `${gemini}:gemini-4-argon-medium`, provider: gemini },
+    { id: `${gemini}:gemini-3.8-flash-low`, provider: gemini },
+    { id: 'openai-codex:gpt-6-sol', provider: 'openai-codex' },
+  ];
+
+  it('ignores an allow-list naming only ids the provider no longer offers', () => {
+    // The Windows report behind #1653: a Gemini list saved against the old
+    // gemini-3.5 catalog hid all six current models while Settings said enabled.
+    const entries: Record<string, ProviderEnablement> = {
+      [gemini]: {
+        enabled: true,
+        models: [`${gemini}:gemini-3-flash-agent`, `${gemini}:gemini-3.5-flash-low`],
+      },
+    };
+    const { entries: next, stale } = dropStaleAllowLists(entries, catalog);
+    expect(stale).toEqual([gemini]);
+    expect(next[gemini]?.models).toBeUndefined();
+    expect(catalog.filter((m) => isModelEnabled(m, next[m.provider]))).toHaveLength(2);
+    // Input is not mutated.
+    expect(entries[gemini].models).toHaveLength(2);
+  });
+
+  it('keeps an allow-list that still matches at least one offered model', () => {
+    const entries: Record<string, ProviderEnablement> = {
+      [gemini]: {
+        enabled: true,
+        models: [`${gemini}:gemini-3.8-flash-low`, `${gemini}:gemini-3.5-flash-low`],
+      },
+    };
+    const { entries: next, stale } = dropStaleAllowLists(entries, catalog);
+    expect(stale).toEqual([]);
+    expect(next[gemini]?.models).toEqual(entries[gemini].models);
+    expect(catalog.filter((m) => isModelEnabled(m, next[m.provider])).map((m) => m.id)).toEqual([
+      `${gemini}:gemini-3.8-flash-low`,
+    ]);
+  });
+
+  it('leaves lists alone for providers that fetched nothing, and for the Claude Code family', () => {
+    const entries: Record<string, ProviderEnablement> = {
+      'opencode': { enabled: true, models: ['opencode:anything'] },
+      'claude-code': { enabled: true, models: ['claude-code'] },
+    };
+    const { entries: next, stale } = dropStaleAllowLists(entries, catalog);
+    expect(stale).toEqual([]);
+    expect(next).toEqual(entries);
+  });
+});
+
 describe('resolveProviderEnabled', () => {
   it('claude-code-cli is off until explicitly enabled', () => {
     expect(resolveProviderEnabled('claude-code-cli', undefined)).toBe(false);

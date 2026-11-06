@@ -69,6 +69,54 @@ export function resolveProviderEnabled(
 }
 
 /**
+ * Drop allow-lists that no longer name anything the provider offers.
+ *
+ * An allow-list is a snapshot of ids from the catalog the user saw when they
+ * curated it. When a provider's catalog turns over completely (Gemini moved
+ * from `gemini-3.5-flash-*` to `gemini-4-argon-*` / `gemini-3.8-flash-*`), a
+ * stale list hides every model and the provider silently vanishes from the
+ * picker while Settings still shows it enabled (#1653). A list that matches
+ * nothing cannot be expressing a preference among the current models, so it
+ * is treated as absent (allow all). A list that still matches at least one id
+ * is honoured as-is; pruning individual stale ids is left to the user.
+ *
+ * The Claude Code family is skipped: its list carries sentinel entries that
+ * `isModelEnabled` interprets, so a catalog comparison would misjudge it.
+ *
+ * Pure: returns a new map and the ids of the providers whose list was ignored,
+ * so the caller can log them.
+ */
+export function dropStaleAllowLists<T extends Record<string, ProviderEnablement | undefined>>(
+  entries: T,
+  catalog: readonly FilterableModel[],
+): { entries: T; stale: string[] } {
+  const idsByProvider = new Map<string, Set<string>>();
+  for (const model of catalog) {
+    let ids = idsByProvider.get(model.provider);
+    if (!ids) {
+      ids = new Set();
+      idsByProvider.set(model.provider, ids);
+    }
+    ids.add(model.id);
+  }
+
+  const stale: string[] = [];
+  const next: Record<string, ProviderEnablement | undefined> = { ...entries };
+  for (const [provider, entry] of Object.entries(entries)) {
+    const list = entry?.models;
+    if (!entry || !list || list.length === 0 || isClaudeCodeFamily(provider)) continue;
+    const offered = idsByProvider.get(provider);
+    // A provider that fetched nothing has no catalog to compare against; leave
+    // its list alone rather than guessing.
+    if (!offered || offered.size === 0) continue;
+    if (list.some((id) => offered.has(id))) continue;
+    stale.push(provider);
+    next[provider] = { ...entry, models: undefined };
+  }
+  return { entries: next as T, stale };
+}
+
+/**
  * Single gate deciding whether a catalog model reaches the picker. Extracted from
  * the `ai:getModels` handler so the behavior that once silently hid Fable 5 is
  * unit-tested (NIM-1486).

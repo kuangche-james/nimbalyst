@@ -1061,6 +1061,21 @@ describe('parseAgyModelList and Gemini 4 Argon / tieredModelIds support', () => 
     ]);
   });
 
+  it('parses the tab-separated columns the real agy CLI prints', () => {
+    // Verbatim head of `agy models` output captured from agy 1.2.x on Windows.
+    const output =
+      'gemini-4-argon-medium\tGemini 4 Argon (Medium)\n' +
+      'gemini-4-argon-high\tGemini 4 Argon (High)\n' +
+      'gemini-3.8-flash-low\tGemini 3.8 Flash (Low)\n' +
+      'claude-opus-5-5-low\tClaude Opus 5.5 (Low)\r\n';
+
+    expect(parseAgyModelList(output)).toEqual([
+      { key: 'gemini-4-argon-medium', displayName: 'Gemini 4 Argon (Medium)' },
+      { key: 'gemini-4-argon-high', displayName: 'Gemini 4 Argon (High)' },
+      { key: 'gemini-3.8-flash-low', displayName: 'Gemini 3.8 Flash (Low)' },
+    ]);
+  });
+
   it('formats bare tieredModelIds keys and accepts Gemini 4 Argon tiers', () => {
     expect(formatModelDisplayName('gemini-4-argon-high')).toBe('Gemini 4 Argon (High)');
     expect(formatModelDisplayName('gemini-3.8-flash-medium')).toBe('Gemini 3.8 Flash (Medium)');
