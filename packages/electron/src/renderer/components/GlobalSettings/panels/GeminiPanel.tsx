@@ -8,9 +8,9 @@ import { AlphaBadge, SETTINGS_ALPHA_TOOLTIP } from '../../common/AlphaBadge';
  *
  * Deliberately not `HeadlessCliProviderPanel`: that panel's whole middle is
  * "install this CLI with this command, then run this login command", and
- * neither applies here. Antigravity is a desktop application you download and
- * sign into once, and the language server Nimbalyst talks to is inside its
- * bundle.
+ * neither applies here. Antigravity ships the `agy` CLI alongside the desktop
+ * application; you install it and sign in once, and Nimbalyst runs Gemini
+ * through that CLI.
  *
  * What this replaces is worth naming, because it is the reason this file
  * exists. While Gemini shipped as an extension, its pane opened with a "Native
@@ -97,8 +97,9 @@ export function GeminiPanel({ config, onToggle }: GeminiPanelProps) {
               <span className="text-[13px] text-[var(--nim-text)]">Not found</span>
             </div>
             <p className="text-[13px] text-[var(--nim-text-muted)] mb-3 leading-relaxed">
-              Install Antigravity and sign in once. Nimbalyst does not install it for you,
-              and it does not need to stay open — only the language server inside it is used.
+              Install the Antigravity CLI (<code>agy</code>) and sign in once. Nimbalyst does
+              not install it for you. The Antigravity IDE alone is not enough: Nimbalyst runs
+              Gemini through the CLI.
             </p>
             <button
               className="inline-flex items-center justify-center py-2 px-4 rounded-md text-sm font-medium cursor-pointer transition-all bg-[var(--nim-surface)] text-[var(--nim-text)] border border-[var(--nim-border)] hover:bg-[var(--nim-surface-hover)]"
@@ -141,8 +142,8 @@ export function GeminiPanel({ config, onToggle }: GeminiPanelProps) {
           <div className="provider-panel-section py-4 mb-4 border-b border-[var(--nim-border)]">
             <h4 className="provider-panel-section-title text-base font-semibold mb-3 text-[var(--nim-text)]">Authentication</h4>
             <p className="text-[13px] text-[var(--nim-text-muted)] mb-3 leading-relaxed">
-              Sign in inside Antigravity. The language server uses that login, so there is
-              nothing to enter here.
+              Sign in once with <code>agy</code> or inside Antigravity. The CLI uses that
+              login, so there is nothing to enter here.
             </p>
             <p className="text-[13px] text-[var(--nim-text-muted)]">
               No API key is required, and Nimbalyst never reads one from your environment.

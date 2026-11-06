@@ -62,6 +62,30 @@ export const AGY_POSIX_MAX_COMMAND_LINE_CHARS = 128_000;
 
 export const AGY_NIMBALYST_MCP_KEY_PREFIX = 'nimbalyst:';
 
+/**
+ * Upper bound on how long one turn may hold `agyStartupGate` while waiting for
+ * the CLI's first stdout record. A CLI that hangs before printing anything must
+ * not block every other Gemini session in the process.
+ */
+export const AGY_STARTUP_GATE_TIMEOUT_MS = 15_000;
+
+/**
+ * Serialises the window between writing agy's global MCP config and the CLI
+ * reading it. Only one turn may be inside that window at a time; the next
+ * turn's write waits until the previous process has produced output.
+ */
+let agyStartupGate: Promise<void> = Promise.resolve();
+
+function acquireAgyStartupGate(): Promise<() => void> {
+  let release!: () => void;
+  const held = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const previous = agyStartupGate;
+  agyStartupGate = previous.then(() => held);
+  return previous.then(() => release);
+}
+
 export interface AgyMcpServerEntry {
   command?: string;
   args?: string[];
@@ -111,8 +135,11 @@ export class AgyCliProtocol implements AgentProtocol {
   }
 
   async createSession(options: SessionOptions): Promise<ProtocolSession> {
+    // MCP servers are written to agy's config file in `sendMessage`, right
+    // before the process spawns, under `agyStartupGate`. Writing them here
+    // would let a second session's `createSession` overwrite the file before
+    // this session's CLI ever reads it.
     const normalizedMcp = normalizeAgyMcpServers(options.mcpServers);
-    await this.syncMcpServersImpl(normalizedMcp);
     const raw: AgySessionRaw = {
       workspacePath: options.workspacePath,
       model: options.model,
@@ -141,7 +168,6 @@ export class AgyCliProtocol implements AgentProtocol {
       this.sessions.set(sessionId, merged);
     }
     const normalizedMcp = normalizeAgyMcpServers(merged.mcpServers);
-    await this.syncMcpServersImpl(normalizedMcp);
     const raw: AgySessionRaw = {
       workspacePath: merged.workspacePath,
       model: merged.model,
@@ -201,168 +227,200 @@ export class AgyCliProtocol implements AgentProtocol {
       }
     >();
 
-    for await (const item of this.runNdjsonImpl({
-      command: this.executablePath,
-      args,
-      cwd: raw.workspacePath,
-      env: this.processEnv,
-      abortSignal: message.abortSignal,
-    })) {
-      if (item.kind === 'garbage') continue;
+    // agy reads `~/.gemini/config/mcp_config.json` once, at process startup,
+    // and has no per-invocation config flag. The file is global, and
+    // `McpConfigService` embeds the workspace and session id in the server
+    // URLs, so two sessions starting together would otherwise race: both
+    // writes land before either CLI reads, and both processes get the second
+    // session's endpoints. Hold the gate from the write until this process
+    // proves it has started (its first stdout record) or the timeout lapses.
+    const releaseGate = await acquireAgyStartupGate();
+    let gateHeld = true;
+    const releaseStartupGate = () => {
+      if (!gateHeld) return;
+      gateHeld = false;
+      releaseGate();
+    };
+    const gateTimer = setTimeout(releaseStartupGate, AGY_STARTUP_GATE_TIMEOUT_MS);
+    gateTimer.unref?.();
 
-      const record = item.value;
-      const eventKind = typeof record.event === 'string' ? record.event : record.type;
+    try {
+      await this.syncMcpServersImpl(normalizeAgyMcpServers(raw.mcpServers));
+    } catch (error) {
+      releaseStartupGate();
+      clearTimeout(gateTimer);
+      throw error;
+    }
 
-      if (eventKind === 'init') {
-        const convId = typeof record.conversation_id === 'string' ? record.conversation_id.trim() : '';
-        if (convId) {
-          session.id = convId;
-          this.sessions.set(convId, {
-            workspacePath: raw.workspacePath,
-            model: raw.model,
-            systemPrompt: raw.systemPrompt,
-            mcpServers: raw.mcpServers,
-          });
+    try {
+      for await (const item of this.runNdjsonImpl({
+        command: this.executablePath,
+        args,
+        cwd: raw.workspacePath,
+        env: this.processEnv,
+        abortSignal: message.abortSignal,
+      })) {
+        // Any output at all means the CLI is up and has loaded its config.
+        releaseStartupGate();
+        if (item.kind === 'garbage') continue;
+
+        const record = item.value;
+        const eventKind = typeof record.event === 'string' ? record.event : record.type;
+
+        if (eventKind === 'init') {
+          const convId = typeof record.conversation_id === 'string' ? record.conversation_id.trim() : '';
+          if (convId) {
+            session.id = convId;
+            this.sessions.set(convId, {
+              workspacePath: raw.workspacePath,
+              model: raw.model,
+              systemPrompt: raw.systemPrompt,
+              mcpServers: raw.mcpServers,
+            });
+          }
+          const initObj =
+            record.init && typeof record.init === 'object' && !Array.isArray(record.init)
+              ? (record.init as Record<string, unknown>)
+              : record;
+          if (typeof initObj.model === 'string' && initObj.model.trim()) {
+            session.appliedModel = initObj.model.trim();
+          }
         }
-        const initObj =
-          record.init && typeof record.init === 'object' && !Array.isArray(record.init)
-            ? (record.init as Record<string, unknown>)
-            : record;
-        if (typeof initObj.model === 'string' && initObj.model.trim()) {
-          session.appliedModel = initObj.model.trim();
-        }
-      }
 
-      if (eventKind === 'result') {
-        const resObj =
-          record.result && typeof record.result === 'object' && !Array.isArray(record.result)
-            ? (record.result as Record<string, unknown>)
-            : record;
-        const convId =
-          typeof resObj.conversation_id === 'string'
-            ? resObj.conversation_id.trim()
-            : typeof record.conversation_id === 'string'
-              ? record.conversation_id.trim()
-              : '';
-        if (convId && !session.id) {
-          session.id = convId;
-          this.sessions.set(convId, {
-            workspacePath: raw.workspacePath,
-            model: raw.model,
-            systemPrompt: raw.systemPrompt,
-            mcpServers: raw.mcpServers,
-          });
-        }
-      }
-
-      let editChanges: AgyEditChange[] | undefined;
-      if (eventKind === 'step_update') {
-        const step =
-          record.step_update && typeof record.step_update === 'object' && !Array.isArray(record.step_update)
-            ? (record.step_update as Record<string, unknown>)
-            : record;
-        if (step.step_type === 'tool') {
-          const toolInfo =
-            step.tool_info && typeof step.tool_info === 'object' && !Array.isArray(step.tool_info)
-              ? (step.tool_info as Record<string, unknown>)
-              : undefined;
-          const toolName =
-            typeof step.tool_name === 'string'
-              ? step.tool_name
-              : typeof toolInfo?.name === 'string'
-                ? toolInfo.name
+        if (eventKind === 'result') {
+          const resObj =
+            record.result && typeof record.result === 'object' && !Array.isArray(record.result)
+              ? (record.result as Record<string, unknown>)
+              : record;
+          const convId =
+            typeof resObj.conversation_id === 'string'
+              ? resObj.conversation_id.trim()
+              : typeof record.conversation_id === 'string'
+                ? record.conversation_id.trim()
                 : '';
-          if (AGY_EDIT_TOOL_NAMES.has(toolName)) {
-            const convId =
-              typeof step.conversation_id === 'string'
-                ? step.conversation_id
-                : typeof record.conversation_id === 'string'
-                  ? record.conversation_id
-                  : 'agy';
-            const stepIndex = typeof step.step_index === 'number' ? step.step_index : 0;
-            const callId =
-              typeof step.tool_call_id === 'string' && step.tool_call_id
-                ? step.tool_call_id
-                : `${convId}:step-${stepIndex}`;
-            const state = typeof step.state === 'string' ? step.state.toUpperCase() : '';
-            const params =
-              toolInfo?.parameters && typeof toolInfo.parameters === 'object' && !Array.isArray(toolInfo.parameters)
-                ? (toolInfo.parameters as Record<string, unknown>)
-                : {};
-            const rawPath =
-              typeof params.Path === 'string'
-                ? params.Path
-                : typeof params.TargetFile === 'string'
-                  ? params.TargetFile
-                  : typeof params.file_path === 'string'
-                    ? params.file_path
-                    : typeof params.path === 'string'
-                      ? params.path
-                      : '';
-            if (rawPath && (state === 'ACTIVE' || state === 'RUNNING' || state === 'PENDING')) {
-              const absPath = path.isAbsolute(rawPath)
-                ? rawPath
-                : path.resolve(raw.workspacePath, rawPath);
-              let beforeContent: string | null = null;
-              try {
-                if (existsSync(absPath)) {
-                  beforeContent = readFileSync(absPath, 'utf8');
-                }
-              } catch {
-                beforeContent = null;
-              }
-              const fallbackAfterContent =
-                typeof params.Content === 'string'
-                  ? params.Content
-                  : typeof params.CodeContent === 'string'
-                    ? params.CodeContent
-                    : typeof params.content === 'string'
-                      ? params.content
-                      : undefined;
-              pendingEdits.set(callId, {
-                absPath,
-                toolName,
-                params,
-                beforeContent,
-                fallbackAfterContent,
-              });
-            } else if (state === 'DONE') {
-              const pending = pendingEdits.get(callId);
-              if (pending) {
-                pendingEdits.delete(callId);
-                let afterContent: string | undefined;
+          if (convId && !session.id) {
+            session.id = convId;
+            this.sessions.set(convId, {
+              workspacePath: raw.workspacePath,
+              model: raw.model,
+              systemPrompt: raw.systemPrompt,
+              mcpServers: raw.mcpServers,
+            });
+          }
+        }
+
+        let editChanges: AgyEditChange[] | undefined;
+        if (eventKind === 'step_update') {
+          const step =
+            record.step_update && typeof record.step_update === 'object' && !Array.isArray(record.step_update)
+              ? (record.step_update as Record<string, unknown>)
+              : record;
+          if (step.step_type === 'tool') {
+            const toolInfo =
+              step.tool_info && typeof step.tool_info === 'object' && !Array.isArray(step.tool_info)
+                ? (step.tool_info as Record<string, unknown>)
+                : undefined;
+            const toolName =
+              typeof step.tool_name === 'string'
+                ? step.tool_name
+                : typeof toolInfo?.name === 'string'
+                  ? toolInfo.name
+                  : '';
+            if (AGY_EDIT_TOOL_NAMES.has(toolName)) {
+              const convId =
+                typeof step.conversation_id === 'string'
+                  ? step.conversation_id
+                  : typeof record.conversation_id === 'string'
+                    ? record.conversation_id
+                    : 'agy';
+              const stepIndex = typeof step.step_index === 'number' ? step.step_index : 0;
+              const callId =
+                typeof step.tool_call_id === 'string' && step.tool_call_id
+                  ? step.tool_call_id
+                  : `${convId}:step-${stepIndex}`;
+              const state = typeof step.state === 'string' ? step.state.toUpperCase() : '';
+              const params =
+                toolInfo?.parameters && typeof toolInfo.parameters === 'object' && !Array.isArray(toolInfo.parameters)
+                  ? (toolInfo.parameters as Record<string, unknown>)
+                  : {};
+              const rawPath =
+                typeof params.Path === 'string'
+                  ? params.Path
+                  : typeof params.TargetFile === 'string'
+                    ? params.TargetFile
+                    : typeof params.file_path === 'string'
+                      ? params.file_path
+                      : typeof params.path === 'string'
+                        ? params.path
+                        : '';
+              if (rawPath && (state === 'ACTIVE' || state === 'RUNNING' || state === 'PENDING')) {
+                const absPath = path.isAbsolute(rawPath)
+                  ? rawPath
+                  : path.resolve(raw.workspacePath, rawPath);
+                let beforeContent: string | null = null;
                 try {
-                  if (existsSync(pending.absPath)) {
-                    afterContent = readFileSync(pending.absPath, 'utf8');
+                  if (existsSync(absPath)) {
+                    beforeContent = readFileSync(absPath, 'utf8');
                   }
                 } catch {
-                  afterContent = undefined;
+                  beforeContent = null;
                 }
-                if (afterContent === undefined) {
-                  afterContent = pending.fallbackAfterContent;
-                }
-                if (typeof afterContent === 'string') {
-                  const mergedParams =
-                    Object.keys(params).length > 0 ? { ...pending.params, ...params } : pending.params;
-                  editChanges = [
-                    buildAgyEditChange(
-                      pending.absPath,
-                      pending.toolName || toolName,
-                      mergedParams,
-                      pending.beforeContent,
-                      afterContent,
-                    ),
-                  ];
+                const fallbackAfterContent =
+                  typeof params.Content === 'string'
+                    ? params.Content
+                    : typeof params.CodeContent === 'string'
+                      ? params.CodeContent
+                      : typeof params.content === 'string'
+                        ? params.content
+                        : undefined;
+                pendingEdits.set(callId, {
+                  absPath,
+                  toolName,
+                  params,
+                  beforeContent,
+                  fallbackAfterContent,
+                });
+              } else if (state === 'DONE') {
+                const pending = pendingEdits.get(callId);
+                if (pending) {
+                  pendingEdits.delete(callId);
+                  let afterContent: string | undefined;
+                  try {
+                    if (existsSync(pending.absPath)) {
+                      afterContent = readFileSync(pending.absPath, 'utf8');
+                    }
+                  } catch {
+                    afterContent = undefined;
+                  }
+                  if (afterContent === undefined) {
+                    afterContent = pending.fallbackAfterContent;
+                  }
+                  if (typeof afterContent === 'string') {
+                    const mergedParams =
+                      Object.keys(params).length > 0 ? { ...pending.params, ...params } : pending.params;
+                    editChanges = [
+                      buildAgyEditChange(
+                        pending.absPath,
+                        pending.toolName || toolName,
+                        mergedParams,
+                        pending.beforeContent,
+                        afterContent,
+                      ),
+                    ];
+                  }
                 }
               }
             }
           }
         }
-      }
 
-      for (const ev of mapAgyRecord(record, editChanges)) {
-        yield ev;
+        for (const ev of mapAgyRecord(record, editChanges)) {
+          yield ev;
+        }
       }
+    } finally {
+      releaseStartupGate();
+      clearTimeout(gateTimer);
     }
   }
 
@@ -424,14 +482,17 @@ function buildAgyEditChange(
   }
 
   // Full-file write (`write_file`) or ambiguous replacement where the `ACTIVE`
-  // disk read lost the race: do NOT report `afterContent` as `beforeContent`.
-  // Leave `beforeContent` empty and `authoritative: false` so
-  // `MessageStreamingHandler` consults `FileSnapshotCache` for existing files
-  // and falls back to `''` for newly created files.
+  // disk read lost the race: the pre-edit content is unknown. Do NOT report
+  // `afterContent` as `beforeContent`, and do NOT report `''` either: the
+  // host writes whatever it is given as the pre-edit tag with
+  // `replaceSpeculative`, and `FileSnapshotCache` cannot always fill the gap
+  // (it skips gitignored and never-snapshotted paths), so an empty string
+  // would render the whole file as added and make Reject empty it. Leaving
+  // `beforeContent` undefined means no `pre_edit_snapshot` entry is emitted
+  // for this path, and the filesystem watcher's own tag stands.
   return {
     path: absPath,
     kind: 'update',
-    beforeContent: '',
     afterContent,
     authoritative: false,
   };

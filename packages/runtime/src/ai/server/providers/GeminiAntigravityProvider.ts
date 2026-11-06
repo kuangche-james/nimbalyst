@@ -671,12 +671,14 @@ export class GeminiAntigravityProvider extends HeadlessCliAgentProvider {
     return undefined;
   }
 
-  /** True when the Antigravity CLI (`agy`) or language server binary is present. */
+  /**
+   * True when the Antigravity CLI (`agy`) is present. The IDE's language
+   * server is deliberately not enough: production turns only run through
+   * `agy` (the legacy server transport needs an injected tool executor), so
+   * reporting it installed would advertise a provider that fails every turn.
+   */
   static isInstalled(): boolean {
-    return (
-      GeminiAntigravityProvider.resolveAgyExecutablePath() !== undefined ||
-      AntigravityServerManager.isInstalled()
-    );
+    return GeminiAntigravityProvider.resolveAgyExecutablePath() !== undefined;
   }
 
   /** Path the install is expected at, for the settings panel to show. */

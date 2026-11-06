@@ -35,7 +35,6 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import { GeminiAntigravityProvider } from '@nimbalyst/runtime/ai/server/providers/GeminiAntigravityProvider';
-import { AntigravityServerManager } from '@nimbalyst/runtime/ai/server/providers/geminiAntigravity/AntigravityServerManager';
 import { scrubProviderApiKeys } from '@nimbalyst/runtime/ai/server/providerApiKeyScrub';
 
 export type HeadlessAgentId = 'grok-build' | 'cursor-agent' | 'antigravity-gemini-agent';
@@ -91,9 +90,11 @@ const PROBE_SPECS: Readonly<Record<HeadlessAgentId, AgentProbeSpec>> = Object.fr
   },
   'antigravity-gemini-agent': {
     kind: 'vendor-app' as const,
+    // Only the CLI counts. The Antigravity IDE's language server may also be
+    // on disk, but production turns run through `agy`; a provider reported
+    // installed on the server binary alone would fail on every turn.
     resolvePath: (pathValue?: string) =>
-      GeminiAntigravityProvider.resolveAgyExecutablePath(pathValue) ??
-      AntigravityServerManager.binaryPath(),
+      GeminiAntigravityProvider.resolveAgyExecutablePath(pathValue) ?? '',
   },
 });
 

@@ -541,29 +541,28 @@ describe('GeminiAntigravityProvider via AgyCliProtocol (HeadlessCliAgentProvider
       );
 
       const preSnapshots = chunks.filter((c) => c.type === 'pre_edit_snapshot');
-      expect(preSnapshots).toHaveLength(3);
+      const postSnapshots = chunks.filter((c) => c.type === 'post_edit_snapshot');
 
       // Unambiguous single replacement recovers beforeContent while keeping authoritative: false
-      expect(preSnapshots[0].preEditSnapshot).toEqual({
-        toolUseId: 'conv-race:step-1',
-        entries: [{ path: editPath, content: 'export const count = 1;\n', kind: 'update' }],
-        authoritative: false,
-      });
+      expect(preSnapshots.map((c) => c.preEditSnapshot)).toEqual([
+        {
+          toolUseId: 'conv-race:step-1',
+          entries: [{ path: editPath, content: 'export const count = 1;\n', kind: 'update' }],
+          authoritative: false,
+        },
+      ]);
 
-      // Ambiguous replacement (`old\nnew\n` -> `new\nnew\n`) does NOT invent `old\nold\n`
-      expect(preSnapshots[1].preEditSnapshot).toEqual({
-        toolUseId: 'conv-race:step-2',
-        entries: [{ path: ambiguousPath, content: '', kind: 'update' }],
-        authoritative: false,
-      });
-
-      // write_file lost the ACTIVE race: does NOT store post-edit content as beforeContent,
-      // and leaves authoritative: false so FileSnapshotCache is consulted first.
-      expect(preSnapshots[2].preEditSnapshot).toEqual({
-        toolUseId: 'conv-race:step-3',
-        entries: [{ path: writePath, content: '', kind: 'update' }],
-        authoritative: false,
-      });
+      // Ambiguous replacement (`old\nnew\n` -> `new\nnew\n`) and write_file both lost the
+      // ACTIVE race with no way to recover the baseline. Neither emits a pre_edit_snapshot:
+      // an empty baseline would be written as the pre-edit tag (replaceSpeculative) and
+      // FileSnapshotCache cannot always fill it (gitignored, never-snapshotted paths), so
+      // the whole file would show as added and Reject would empty it. Post-edit content
+      // is still recorded for all three.
+      expect(postSnapshots.flatMap((c) => c.postEditSnapshot?.entries.map((e) => e.path))).toEqual([
+        editPath,
+        ambiguousPath,
+        writePath,
+      ]);
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
@@ -654,31 +653,28 @@ describe('GeminiAntigravityProvider via AgyCliProtocol (HeadlessCliAgentProvider
       );
 
       const preSnapshots = chunks.filter((c) => c.type === 'pre_edit_snapshot');
-      expect(preSnapshots).toHaveLength(3);
+      const postSnapshots = chunks.filter((c) => c.type === 'post_edit_snapshot');
 
       // Duplicate replacement text, but StartLine/EndLine pins it to line 3:
       // only that occurrence is reversed, the first `x = 2;` is left alone.
-      expect(preSnapshots[0].preEditSnapshot).toEqual({
-        toolUseId: 'conv-reverse:step-1',
-        entries: [{ path: rangedPath, content: 'x = 2;\ny = 1;\nx = 1;\n', kind: 'update' }],
-        authoritative: false,
-      });
-
-      // One ambiguous chunk aborts the whole multi-chunk reversal rather than
-      // producing a baseline where only `beta` -> `alpha` was undone.
-      expect(preSnapshots[1].preEditSnapshot).toEqual({
-        toolUseId: 'conv-reverse:step-2',
-        entries: [{ path: multiPath, content: '', kind: 'update' }],
-        authoritative: false,
-      });
-
-      // `foo bar` -> `foo`: the replacement is inside the target, so reversal
-      // would loop on itself; fall back to the host cache.
-      expect(preSnapshots[2].preEditSnapshot).toEqual({
-        toolUseId: 'conv-reverse:step-3',
-        entries: [{ path: nestedPath, content: '', kind: 'update' }],
-        authoritative: false,
-      });
+      //
+      // The other two have no trustworthy baseline and emit no pre_edit_snapshot:
+      // - one ambiguous chunk aborts the whole multi-chunk reversal rather than
+      //   producing a baseline where only `beta` -> `alpha` was undone;
+      // - `foo bar` -> `foo`: the replacement is inside the target, so reversal
+      //   would loop on itself.
+      expect(preSnapshots.map((c) => c.preEditSnapshot)).toEqual([
+        {
+          toolUseId: 'conv-reverse:step-1',
+          entries: [{ path: rangedPath, content: 'x = 2;\ny = 1;\nx = 1;\n', kind: 'update' }],
+          authoritative: false,
+        },
+      ]);
+      expect(postSnapshots.flatMap((c) => c.postEditSnapshot?.entries.map((e) => e.path))).toEqual([
+        rangedPath,
+        multiPath,
+        nestedPath,
+      ]);
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
@@ -831,6 +827,67 @@ describe('GeminiAntigravityProvider via AgyCliProtocol (HeadlessCliAgentProvider
     }
   });
 
+  it('holds the next session\'s MCP config write until the previous agy process has produced output', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'agy-mcp-gate-'));
+    try {
+      BaseAgentProvider.setTrustChecker(() => ({ trusted: true, mode: 'allow-all' }));
+      GeminiAntigravityProvider.setAgyPathLoader(() => process.execPath);
+
+      // Each "process" starts only when the test says so, standing in for the
+      // real CLI's startup window between spawn and its first stdout line.
+      const timeline: string[] = [];
+      let startFirst!: () => void;
+      const firstMayStart = new Promise<void>((resolve) => {
+        startFirst = resolve;
+      });
+      const makeProtocol = (label: string, gateOnStart?: Promise<void>) =>
+        new AgyCliProtocol({
+          syncMcpServers: async () => {
+            timeline.push(`${label}:write`);
+          },
+          runNdjson: async function* () {
+            if (gateOnStart) await gateOnStart;
+            timeline.push(`${label}:init`);
+            yield {
+              kind: 'record',
+              value: {
+                event: 'init',
+                conversation_id: `conv-${label}`,
+                init: { model: 'gemini-4-argon-medium', cwd: dir },
+              },
+            };
+            yield {
+              kind: 'record',
+              value: {
+                event: 'result',
+                result: { conversation_id: `conv-${label}`, status: 'SUCCESS', response: 'OK' },
+              },
+            };
+          },
+        });
+
+      const first = new GeminiAntigravityProvider({ protocol: makeProtocol('a', firstMayStart) });
+      const second = new GeminiAntigravityProvider({ protocol: makeProtocol('b') });
+      await first.initialize({});
+      await second.initialize({});
+
+      const firstTurn = collect(first.sendMessage('one', undefined, 'gate-a', undefined, dir));
+      // Give the first turn time to write its config and block on "process startup".
+      await vi.waitFor(() => expect(timeline).toContain('a:write'));
+      const secondTurn = collect(second.sendMessage('two', undefined, 'gate-b', undefined, dir));
+      await new Promise((resolve) => setTimeout(resolve, 50));
+
+      // The second session has not been allowed to overwrite the file yet.
+      expect(timeline).toEqual(['a:write']);
+
+      startFirst();
+      await Promise.all([firstTurn, secondTurn]);
+      expect(timeline).toEqual(['a:write', 'a:init', 'b:write', 'b:init']);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it('bounds inlined attachments on Windows, preserves long prompts on POSIX, and fails explicitly with E2BIG instead of truncating', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'agy-cmdline-'));
     try {
@@ -892,6 +949,17 @@ describe('GeminiAntigravityProvider via AgyCliProtocol (HeadlessCliAgentProvider
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
+  });
+});
+
+describe('GeminiAntigravityProvider.isInstalled', () => {
+  it('ignores the IDE language server: only the agy CLI can serve a production turn', () => {
+    vi.spyOn(GeminiAntigravityProvider, 'resolveAgyExecutablePath').mockReturnValue(undefined);
+    vi.spyOn(AntigravityServerManager, 'isInstalled').mockReturnValue(true);
+    expect(GeminiAntigravityProvider.isInstalled()).toBe(false);
+
+    vi.spyOn(GeminiAntigravityProvider, 'resolveAgyExecutablePath').mockReturnValue('/usr/local/bin/agy');
+    expect(GeminiAntigravityProvider.isInstalled()).toBe(true);
   });
 });
 

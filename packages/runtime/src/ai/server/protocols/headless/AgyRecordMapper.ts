@@ -22,6 +22,12 @@ export type AgyTokenUsage = NonNullable<ProtocolEvent['usage']>;
 export interface AgyEditChange {
   path: string;
   kind: 'add' | 'update';
+  /**
+   * Pre-edit content. Undefined when it is genuinely unknown (the CLI wrote
+   * the file before the `ACTIVE` record was consumed and no unambiguous
+   * reverse patch exists): the provider then emits no `pre_edit_snapshot`
+   * entry for the path rather than a destructive empty baseline.
+   */
   beforeContent?: string;
   afterContent: string;
   /**
