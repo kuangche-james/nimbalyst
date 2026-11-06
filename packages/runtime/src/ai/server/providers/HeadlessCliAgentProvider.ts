@@ -18,7 +18,11 @@ import { BaseAgentProvider } from './BaseAgentProvider';
 import { scrubProviderApiKeys } from '../providerApiKeyScrub';
 import { buildUserMessageAddition } from './documentContextUtils';
 import { describeUnusableWorkspacePath } from './workspacePreconditions';
-import { buildClaudeCodeSystemPrompt } from '../../prompt';
+import {
+  buildClaudeCodeSystemPrompt,
+  buildMetaAgentSystemPrompt,
+  type MetaAgentWorkflowPreset,
+} from '../../prompt';
 import type {
   ProviderConfig,
   DocumentContext,
@@ -242,8 +246,15 @@ export abstract class HeadlessCliAgentProvider extends BaseAgentProvider {
       return;
     }
 
+    const agentRole = await this.getAgentRole(sessionId);
+    const isMetaAgent = agentRole === 'meta-agent';
+    const workflowPreset = isMetaAgent ? await this.getWorkflowPreset(sessionId) : 'default';
     const systemPrompt = this.buildSystemPrompt(
-      documentContext, await this.getSessionDirective(sessionId), this.isNamedOutOfBand(sessionId, documentContext),
+      documentContext,
+      await this.getSessionDirective(sessionId),
+      this.isNamedOutOfBand(sessionId, documentContext),
+      isMetaAgent,
+      workflowPreset,
     );
     const { userMessageAddition, messageWithContext } = buildUserMessageAddition(message, documentContext);
 
@@ -295,7 +306,7 @@ export abstract class HeadlessCliAgentProvider extends BaseAgentProvider {
       const mcpServers = await this.mcpConfigService.getMcpServersConfig({
         sessionId,
         workspacePath: documentContext?.mcpConfigWorkspacePath || workspacePath,
-        profile: 'standard',
+        profile: isMetaAgent ? 'meta-agent' : 'standard',
       });
 
       const existingSessionId = this.sessions.getSessionId(sessionId || '');
@@ -307,6 +318,7 @@ export abstract class HeadlessCliAgentProvider extends BaseAgentProvider {
         model: resolvedModel,
         systemPrompt,
         mcpServers,
+        ...(isMetaAgent ? { allowedTools: BaseAgentProvider.META_AGENT_ALLOWED_TOOLS } : {}),
         permissionMode: permission.permissionMode ?? undefined,
         raw: { permissionsPath: documentContext?.permissionsPath },
       };
@@ -525,7 +537,16 @@ export abstract class HeadlessCliAgentProvider extends BaseAgentProvider {
     documentContext?: DocumentContext,
     sessionDirective?: string,
     hasOutOfBandNaming: boolean = false,
+    isMetaAgent: boolean = false,
+    workflowPreset: MetaAgentWorkflowPreset = 'default',
   ): string {
+    if (isMetaAgent) {
+      return buildMetaAgentSystemPrompt('codex', workflowPreset, {
+        provider: this.getProviderName(),
+        model: this.config?.model ?? undefined,
+        sessionDirective,
+      });
+    }
     return buildClaudeCodeSystemPrompt({
       hasSessionNaming: isInternalMcpServerEnabled(),
       hasOutOfBandNaming,

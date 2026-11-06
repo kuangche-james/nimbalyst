@@ -15,7 +15,10 @@
  *     the multi-turn conversation in place.
  */
 
+import { randomBytes } from 'node:crypto';
 import { existsSync, readFileSync } from 'node:fs';
+import * as fsPromises from 'node:fs/promises';
+import * as os from 'node:os';
 import * as path from 'node:path';
 import {
   AgentProtocol,
@@ -51,19 +54,34 @@ export const AGY_INLINE_DOCUMENT_BUDGET = 16_000;
 /**
  * Windows `CreateProcessW` caps the entire command line (executable + flags +
  * positional prompt) at 32,767 UTF-16 code units. Bound the assembled command
- * line conservatively at 28,000 characters so quoting/escaping and long paths
- * never prevent a turn from starting on Windows.
+ * line conservatively at 28,000 characters on Windows; POSIX platforms permit
+ * much larger single-argument lengths (128 KiB+).
  */
 export const AGY_MAX_COMMAND_LINE_CHARS = 28_000;
+export const AGY_POSIX_MAX_COMMAND_LINE_CHARS = 128_000;
+
+export const AGY_NIMBALYST_MCP_KEY_PREFIX = 'nimbalyst:';
+
+export interface AgyMcpServerEntry {
+  command?: string;
+  args?: string[];
+  env?: Record<string, string>;
+  url?: string;
+  headers?: Record<string, string>;
+  [key: string]: unknown;
+}
 
 interface AgySessionRaw extends Record<string, unknown> {
   workspacePath: string;
   model?: string;
   systemPrompt?: string;
+  mcpServers?: SessionOptions['mcpServers'];
 }
 
 export interface AgyCliProtocolDeps {
   runNdjson?: (options: HeadlessNdjsonRunOptions) => AsyncGenerator<HeadlessNdjsonItem>;
+  mcpConfigPath?: string;
+  syncMcpServers?: (servers: Record<string, AgyMcpServerEntry>) => Promise<void>;
 }
 
 export class AgyCliProtocol implements AgentProtocol {
@@ -73,9 +91,15 @@ export class AgyCliProtocol implements AgentProtocol {
   private processEnv: Record<string, string> | undefined;
   private readonly sessions = new Map<string, SessionOptions>();
   private readonly runNdjsonImpl: NonNullable<AgyCliProtocolDeps['runNdjson']>;
+  private readonly mcpConfigPath?: string;
+  private readonly syncMcpServersImpl: (servers: Record<string, AgyMcpServerEntry>) => Promise<void>;
 
   constructor(deps?: AgyCliProtocolDeps) {
     this.runNdjsonImpl = deps?.runNdjson ?? runHeadlessNdjson;
+    this.mcpConfigPath = deps?.mcpConfigPath;
+    this.syncMcpServersImpl =
+      deps?.syncMcpServers ??
+      ((servers) => syncAgyMcpConfigFile(servers, this.mcpConfigPath));
   }
 
   setAgyPath(executablePath: string): void {
@@ -87,15 +111,18 @@ export class AgyCliProtocol implements AgentProtocol {
   }
 
   async createSession(options: SessionOptions): Promise<ProtocolSession> {
+    const normalizedMcp = normalizeAgyMcpServers(options.mcpServers);
+    await this.syncMcpServersImpl(normalizedMcp);
     const raw: AgySessionRaw = {
       workspacePath: options.workspacePath,
       model: options.model,
       systemPrompt: options.systemPrompt,
+      mcpServers: options.mcpServers,
     };
     return {
       id: '',
       platform: this.platform,
-      deliveredMcpServerCount: 0,
+      deliveredMcpServerCount: Object.keys(normalizedMcp).length,
       raw,
     };
   }
@@ -113,15 +140,18 @@ export class AgyCliProtocol implements AgentProtocol {
     if (sessionId) {
       this.sessions.set(sessionId, merged);
     }
+    const normalizedMcp = normalizeAgyMcpServers(merged.mcpServers);
+    await this.syncMcpServersImpl(normalizedMcp);
     const raw: AgySessionRaw = {
       workspacePath: merged.workspacePath,
       model: merged.model,
       systemPrompt: merged.systemPrompt,
+      mcpServers: merged.mcpServers,
     };
     return {
       id: sessionId,
       platform: this.platform,
-      deliveredMcpServerCount: 0,
+      deliveredMcpServerCount: Object.keys(normalizedMcp).length,
       raw,
     };
   }
@@ -191,6 +221,7 @@ export class AgyCliProtocol implements AgentProtocol {
             workspacePath: raw.workspacePath,
             model: raw.model,
             systemPrompt: raw.systemPrompt,
+            mcpServers: raw.mcpServers,
           });
         }
         const initObj =
@@ -219,6 +250,7 @@ export class AgyCliProtocol implements AgentProtocol {
             workspacePath: raw.workspacePath,
             model: raw.model,
             systemPrompt: raw.systemPrompt,
+            mcpServers: raw.mcpServers,
           });
         }
       }
@@ -375,8 +407,11 @@ function buildAgyEditChange(
   // `observedBefore === afterContent`: the CLI already wrote the file before
   // the parent process consumed the `ACTIVE` stdout line. For in-place edit
   // tools (`edit_file`, `replace_file_content`, `multi_replace_file_content`),
-  // reverse-apply the replacement hunk(s) against `afterContent` to recover
-  // the exact pre-edit baseline deterministically.
+  // recover the pre-edit baseline ONLY when the replacement hunk is
+  // unambiguous (single match or bounded by an unchanged-line-count range).
+  // Always keep `authoritative: false` so `MessageStreamingHandler` consults
+  // `FileSnapshotCache` first and only falls back to `beforeContent` on a
+  // cache miss.
   const recovered = tryReverseApplyAgyEdit(toolName, params, afterContent);
   if (recovered !== null && recovered !== afterContent) {
     return {
@@ -384,15 +419,15 @@ function buildAgyEditChange(
       kind: 'update',
       beforeContent: recovered,
       afterContent,
-      authoritative: true,
+      authoritative: false,
     };
   }
 
-  // Full-file write (`write_file`) where the `ACTIVE` disk read lost the race:
-  // do NOT report `afterContent` as `beforeContent`. Leave `beforeContent`
-  // empty and `authoritative: false` so `MessageStreamingHandler` consults
-  // `FileSnapshotCache` for existing files and falls back to `''` for newly
-  // created files.
+  // Full-file write (`write_file`) or ambiguous replacement where the `ACTIVE`
+  // disk read lost the race: do NOT report `afterContent` as `beforeContent`.
+  // Leave `beforeContent` empty and `authoritative: false` so
+  // `MessageStreamingHandler` consults `FileSnapshotCache` for existing files
+  // and falls back to `''` for newly created files.
   return {
     path: absPath,
     kind: 'update',
@@ -400,6 +435,69 @@ function buildAgyEditChange(
     afterContent,
     authoritative: false,
   };
+}
+
+function countOccurrences(haystack: string, needle: string): number {
+  if (!needle) return 0;
+  let count = 0;
+  let idx = 0;
+  while (true) {
+    const found = haystack.indexOf(needle, idx);
+    if (found < 0) break;
+    count++;
+    idx = found + needle.length;
+  }
+  return count;
+}
+
+function tryReverseApplySingleAgyHunk(
+  text: string,
+  target: string,
+  replacement: string,
+  startLine?: unknown,
+  endLine?: unknown,
+): string | null {
+  if (!replacement || target === replacement || target.includes(replacement)) {
+    return null;
+  }
+
+  if (
+    typeof startLine === 'number' &&
+    typeof endLine === 'number' &&
+    Number.isInteger(startLine) &&
+    Number.isInteger(endLine) &&
+    startLine >= 1 &&
+    endLine >= startLine
+  ) {
+    const targetLines = target.split('\n').length;
+    const replacementLines = replacement.split('\n').length;
+    if (targetLines === replacementLines) {
+      const lines = text.split('\n');
+      if (endLine <= lines.length) {
+        const region = lines.slice(startLine - 1, endLine).join('\n');
+        if (countOccurrences(region, replacement) === 1) {
+          const regionIdx = region.indexOf(replacement);
+          const restoredRegion =
+            region.slice(0, regionIdx) + target + region.slice(regionIdx + replacement.length);
+          return [
+            ...lines.slice(0, startLine - 1),
+            ...restoredRegion.split('\n'),
+            ...lines.slice(endLine),
+          ].join('\n');
+        }
+      }
+    }
+    if (countOccurrences(text, replacement) !== 1) {
+      return null;
+    }
+  }
+
+  if (countOccurrences(text, replacement) !== 1) {
+    return null;
+  }
+
+  const idx = text.indexOf(replacement);
+  return text.slice(0, idx) + target + text.slice(idx + replacement.length);
 }
 
 function tryReverseApplyAgyEdit(
@@ -420,14 +518,14 @@ function tryReverseApplyAgyEdit(
         : typeof params.ReplacementContent === 'string'
           ? params.ReplacementContent
           : undefined;
-    if (
-      target !== undefined &&
-      replacement !== undefined &&
-      replacement.length > 0 &&
-      target !== replacement &&
-      afterContent.includes(replacement)
-    ) {
-      return afterContent.split(replacement).join(target);
+    if (target !== undefined && replacement !== undefined) {
+      return tryReverseApplySingleAgyHunk(
+        afterContent,
+        target,
+        replacement,
+        params.StartLine,
+        params.EndLine,
+      );
     }
   }
 
@@ -436,21 +534,26 @@ function tryReverseApplyAgyEdit(
     let changed = false;
     for (let i = params.ReplacementChunks.length - 1; i >= 0; i--) {
       const chunk = params.ReplacementChunks[i];
-      if (!chunk || typeof chunk !== 'object') continue;
+      if (!chunk || typeof chunk !== 'object') return null;
       const rec = chunk as Record<string, unknown>;
       const target = typeof rec.TargetContent === 'string' ? rec.TargetContent : undefined;
       const replacement =
         typeof rec.ReplacementContent === 'string' ? rec.ReplacementContent : undefined;
-      if (
-        target !== undefined &&
-        replacement !== undefined &&
-        replacement.length > 0 &&
-        target !== replacement &&
-        current.includes(replacement)
-      ) {
-        current = current.replace(replacement, () => target);
-        changed = true;
+      if (target === undefined || replacement === undefined) {
+        return null;
       }
+      const next = tryReverseApplySingleAgyHunk(
+        current,
+        target,
+        replacement,
+        rec.StartLine,
+        rec.EndLine,
+      );
+      if (next === null) {
+        return null;
+      }
+      current = next;
+      changed = true;
     }
     if (changed) return current;
   }
@@ -462,8 +565,11 @@ export function formatAgyPromptWithAttachments(
   message: ProtocolMessage,
   systemPrompt?: string,
   commandLineOverhead = 256,
+  platform: NodeJS.Platform = process.platform,
 ): string {
-  const maxPromptChars = Math.max(4_096, AGY_MAX_COMMAND_LINE_CHARS - commandLineOverhead);
+  const maxCommandLineChars =
+    platform === 'win32' ? AGY_MAX_COMMAND_LINE_CHARS : AGY_POSIX_MAX_COMMAND_LINE_CHARS;
+  const maxPromptChars = Math.max(4_096, maxCommandLineChars - commandLineOverhead);
   const trimmedSystem = systemPrompt?.trim() ?? '';
   const systemSection = trimmedSystem
     ? `<system_instructions>\n${trimmedSystem}\n</system_instructions>`
@@ -518,23 +624,147 @@ export function formatAgyPromptWithAttachments(
   if (referencedPaths.length > 0) userSections.push(`Attached files:\n${referencedPaths.join('\n')}`);
   const userBody = userSections.join('\n\n');
 
-  if (!systemSection) {
-    return userBody.length <= maxPromptChars ? userBody : userBody.slice(0, maxPromptChars);
+  const fullPrompt = systemSection ? `${systemSection}\n\n${userBody}` : userBody;
+  if (fullPrompt.length > maxPromptChars) {
+    const err = new Error(
+      `spawn E2BIG: prompt length (${fullPrompt.length}) exceeds command-line limit (${maxPromptChars})`,
+    ) as NodeJS.ErrnoException;
+    err.code = 'E2BIG';
+    throw err;
   }
 
-  const combined = `${systemSection}\n\n${userBody}`;
-  if (combined.length <= maxPromptChars) {
-    return combined;
+  return fullPrompt;
+}
+
+export function normalizeAgyMcpServers(
+  mcpServers?: Record<string, unknown>,
+): Record<string, AgyMcpServerEntry> {
+  const normalized: Record<string, AgyMcpServerEntry> = {};
+  if (!mcpServers || typeof mcpServers !== 'object') return normalized;
+
+  for (const [name, raw] of Object.entries(mcpServers)) {
+    if (!name || !raw || typeof raw !== 'object') continue;
+    const rec = raw as Record<string, unknown>;
+    const url =
+      typeof rec.url === 'string' && rec.url.trim()
+        ? rec.url.trim()
+        : typeof rec.serverUrl === 'string' && rec.serverUrl.trim()
+          ? rec.serverUrl.trim()
+          : undefined;
+    if (url) {
+      const entry: AgyMcpServerEntry = { url };
+      if (rec.headers && typeof rec.headers === 'object' && !Array.isArray(rec.headers)) {
+        const headers: Record<string, string> = {};
+        for (const [k, v] of Object.entries(rec.headers as Record<string, unknown>)) {
+          if (typeof v === 'string') headers[k] = v;
+        }
+        if (Object.keys(headers).length > 0) entry.headers = headers;
+      }
+      normalized[name] = entry;
+      continue;
+    }
+
+    if (typeof rec.command === 'string' && rec.command.trim()) {
+      const entry: AgyMcpServerEntry = { command: rec.command.trim() };
+      if (Array.isArray(rec.args)) {
+        entry.args = rec.args.filter((a): a is string => typeof a === 'string');
+      }
+      if (rec.env && typeof rec.env === 'object' && !Array.isArray(rec.env)) {
+        const env: Record<string, string> = {};
+        for (const [k, v] of Object.entries(rec.env as Record<string, unknown>)) {
+          if (typeof v === 'string') env[k] = v;
+        }
+        if (Object.keys(env).length > 0) entry.env = env;
+      }
+      normalized[name] = entry;
+    }
   }
 
-  // Keep the user's message and attachment references intact first; fit as much
-  // of the system instructions as the Windows command-line budget allows.
-  const availableForSystem = maxPromptChars - userBody.length - 40;
-  if (availableForSystem > 64) {
-    const boundedSystem = `<system_instructions>\n${trimmedSystem.slice(0, availableForSystem)}\n</system_instructions>`;
-    return `${boundedSystem}\n\n${userBody}`;
+  return normalized;
+}
+
+export function resolveDefaultAgyMcpConfigPath(homedir = os.homedir()): string {
+  return path.join(homedir, '.gemini', 'config', 'mcp_config.json');
+}
+
+let agyMcpSyncQueue: Promise<unknown> = Promise.resolve();
+
+export function syncAgyMcpConfigFile(
+  servers: Record<string, AgyMcpServerEntry>,
+  configPath = resolveDefaultAgyMcpConfigPath(),
+): Promise<void> {
+  const task = () => syncAgyMcpConfigFileExclusive(servers, configPath);
+  const next = agyMcpSyncQueue.then(task, task);
+  agyMcpSyncQueue = next.catch(() => undefined);
+  return next;
+}
+
+async function syncAgyMcpConfigFileExclusive(
+  servers: Record<string, AgyMcpServerEntry>,
+  configPath: string,
+): Promise<void> {
+  let existing: { mcpServers?: Record<string, AgyMcpServerEntry>; [key: string]: unknown } | null =
+    null;
+  let existingMode: number | null = null;
+
+  try {
+    const raw = await fsPromises.readFile(configPath, 'utf8');
+    existing = JSON.parse(raw) as {
+      mcpServers?: Record<string, AgyMcpServerEntry>;
+      [key: string]: unknown;
+    };
+    existingMode = (await fsPromises.stat(configPath)).mode & 0o777;
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException)?.code;
+    if (code !== 'ENOENT') {
+      return;
+    }
   }
-  return userBody.length <= maxPromptChars ? userBody : userBody.slice(0, maxPromptChars);
+
+  const previousServers = existing?.mcpServers ?? {};
+  const hasNimbalystEntries = Object.keys(previousServers).some((key) =>
+    key.startsWith(AGY_NIMBALYST_MCP_KEY_PREFIX),
+  );
+
+  if (Object.keys(servers).length === 0 && !hasNimbalystEntries) {
+    return;
+  }
+
+  const nextServers: Record<string, AgyMcpServerEntry> = {};
+  for (const [name, entry] of Object.entries(previousServers)) {
+    if (!name.startsWith(AGY_NIMBALYST_MCP_KEY_PREFIX)) {
+      nextServers[name] = entry;
+    }
+  }
+  for (const [name, entry] of Object.entries(servers)) {
+    const prefixedName = name.startsWith(AGY_NIMBALYST_MCP_KEY_PREFIX)
+      ? name
+      : `${AGY_NIMBALYST_MCP_KEY_PREFIX}${name}`;
+    nextServers[prefixedName] = entry;
+  }
+
+  const merged = { ...(existing ?? {}), mcpServers: nextServers };
+  const serialized = `${JSON.stringify(merged, null, 2)}\n`;
+
+  try {
+    await fsPromises.mkdir(path.dirname(configPath), { recursive: true });
+    const tempPath = path.join(
+      path.dirname(configPath),
+      `${path.basename(configPath)}.${randomBytes(6).toString('hex')}.tmp`,
+    );
+    try {
+      await fsPromises.writeFile(tempPath, serialized, { encoding: 'utf8', mode: 0o600 });
+      if (existingMode !== null) {
+        await fsPromises.chmod(tempPath, existingMode).catch(() => undefined);
+      }
+      await fsPromises.rename(tempPath, configPath);
+    } catch (writeError) {
+      await fsPromises.rm(tempPath, { force: true }).catch(() => undefined);
+      throw writeError;
+    }
+  } catch {
+    // Non-fatal: a turn without MCP servers is better than a turn that fails to start.
+  }
 }
 
 function stripProviderPrefix(model: string | undefined): string | undefined {

@@ -20,7 +20,7 @@ import {
 } from './HeadlessCliAgentProvider';
 import { AgyCliProtocol } from '../protocols/AgyCliProtocol';
 import type { ProtocolEvent, ToolResult } from '../protocols/ProtocolInterface';
-import { appendSessionDirective } from '../../prompt';
+import { appendSessionDirective, type MetaAgentWorkflowPreset } from '../../prompt';
 import {
   AntigravityServerManager,
   AntigravityVersionGateError,
@@ -85,6 +85,34 @@ function clampCommandOutput(text: string): string {
   return text.length <= RUN_COMMAND_MAX_OUTPUT
     ? text
     : `${text.slice(0, RUN_COMMAND_MAX_OUTPUT)}\n\n[output truncated at ${RUN_COMMAND_MAX_OUTPUT} characters]`;
+}
+
+export function formatPriorMessagesForAgySeed(
+  messages: Message[] | undefined,
+  currentMessage: string,
+): string | undefined {
+  if (!messages || messages.length === 0) return undefined;
+  const prior = [...messages];
+  const last = prior[prior.length - 1];
+  if (
+    last?.role === 'user' &&
+    typeof last.content === 'string' &&
+    last.content.trim() === currentMessage.trim()
+  ) {
+    prior.pop();
+  }
+
+  const formatted = prior
+    .filter(
+      (m) =>
+        (m.role === 'user' || m.role === 'assistant') &&
+        typeof m.content === 'string' &&
+        m.content.trim().length > 0,
+    )
+    .map((m) => `${m.role === 'user' ? 'User' : 'Assistant'}:\n${m.content.trim()}`);
+
+  if (formatted.length === 0) return undefined;
+  return `<conversation_history>\nThe following is the prior conversation history from this session before continuing:\n\n${formatted.join('\n\n')}\n</conversation_history>`;
 }
 
 const DESCRIPTOR: HeadlessCliAgentDescriptor = {
@@ -188,6 +216,7 @@ export class GeminiAntigravityProvider extends HeadlessCliAgentProvider {
   }
 
   private turnSystemPromptOverride: string | undefined;
+  private turnHistorySeed: string | undefined;
 
   /**
    * Emit `pre_edit_snapshot` / `post_edit_snapshot` chunks when `AgyCliProtocol`
@@ -195,11 +224,10 @@ export class GeminiAntigravityProvider extends HeadlessCliAgentProvider {
    * `getFileChangeFidelity() === 'tool-args'` so the filesystem watcher remains
    * active for shell-driven deletes and moves.
    *
-   * `authoritative` is left `false` unless `AgyCliProtocol` deterministically
-   * reconstructed `beforeContent` by reverse-applying `edit_file`'s replacement
-   * hunks. Leaving disk-read snapshots non-authoritative ensures
-   * `MessageStreamingHandler` consults `FileSnapshotCache` first when the CLI
-   * writes a file before the parent consumes the `ACTIVE` stdout record.
+   * `authoritative` is left `false` for `AgyCliProtocol` snapshots so
+   * `MessageStreamingHandler` always consults `FileSnapshotCache` first and
+   * falls back to `beforeContent` (disk read or unambiguous reverse-applied
+   * hunk) on cache misses.
    */
   protected override *buildEditSnapshots(event: ProtocolEvent): Generator<StreamChunk> {
     if (event.type !== 'tool_result') return;
@@ -261,11 +289,20 @@ export class GeminiAntigravityProvider extends HeadlessCliAgentProvider {
     documentContext?: DocumentContext,
     sessionDirective?: string,
     hasOutOfBandNaming: boolean = false,
+    isMetaAgent: boolean = false,
+    workflowPreset: MetaAgentWorkflowPreset = 'default',
   ): string {
-    const base = super.buildSystemPrompt(documentContext, sessionDirective, hasOutOfBandNaming);
-    const extra = this.turnSystemPromptOverride?.trim();
-    if (!extra) return base;
-    return base ? `${base}\n\n${extra}` : extra;
+    const base = super.buildSystemPrompt(
+      documentContext,
+      sessionDirective,
+      hasOutOfBandNaming,
+      isMetaAgent,
+      workflowPreset,
+    );
+    const parts = [base, this.turnSystemPromptOverride?.trim(), this.turnHistorySeed].filter(
+      (part): part is string => Boolean(part && part.length > 0),
+    );
+    return parts.join('\n\n');
   }
 
   override async *sendMessage(
@@ -292,7 +329,12 @@ export class GeminiAntigravityProvider extends HeadlessCliAgentProvider {
       return;
     }
 
+    const hasNativeSession = Boolean(sessionId && this.sessions.getSessionId(sessionId));
     this.turnSystemPromptOverride = systemPrompt;
+    this.turnHistorySeed =
+      !hasNativeSession && messages && messages.length > 0
+        ? formatPriorMessagesForAgySeed(messages, message)
+        : undefined;
     try {
       yield* super.sendMessage(
         message,
@@ -304,6 +346,7 @@ export class GeminiAntigravityProvider extends HeadlessCliAgentProvider {
       );
     } finally {
       this.turnSystemPromptOverride = undefined;
+      this.turnHistorySeed = undefined;
     }
   }
 

@@ -4,7 +4,7 @@
  * protocol (`AgyCliProtocol`), record mapper (`mapAgyRecord`), model discovery
  * (`parseAgyModelList`), and transcript parser (`GeminiAntigravityRawParser`).
  */
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
@@ -377,9 +377,11 @@ describe('GeminiAntigravityProvider via AgyCliProtocol (HeadlessCliAgentProvider
     const dir = mkdtempSync(join(tmpdir(), 'agy-race-'));
     try {
       const editPath = join(dir, 'edited.ts');
+      const ambiguousPath = join(dir, 'ambiguous.ts');
       const writePath = join(dir, 'overwritten.ts');
-      // Both files have ALREADY been modified on disk before ACTIVE arrives
+      // All three files have ALREADY been modified on disk before ACTIVE arrives
       writeFileSync(editPath, 'export const count = 2;\n', 'utf8');
+      writeFileSync(ambiguousPath, 'new\nnew\n', 'utf8');
       writeFileSync(writePath, 'brand new content\n', 'utf8');
 
       BaseAgentProvider.setTrustChecker(() => ({ trusted: true, mode: 'allow-all' }));
@@ -447,6 +449,49 @@ describe('GeminiAntigravityProvider via AgyCliProtocol (HeadlessCliAgentProvider
                 step_index: 2,
                 state: 'ACTIVE',
                 step_type: 'tool',
+                tool_name: 'edit_file',
+                tool_info: {
+                  name: 'edit_file',
+                  parameters: {
+                    Path: ambiguousPath,
+                    Target: 'old',
+                    Replacement: 'new',
+                  },
+                },
+              },
+            },
+          };
+          yield {
+            kind: 'record',
+            value: {
+              event: 'step_update',
+              step_update: {
+                conversation_id: 'conv-race',
+                step_index: 2,
+                state: 'DONE',
+                step_type: 'tool',
+                tool_name: 'edit_file',
+                tool_info: {
+                  name: 'edit_file',
+                  parameters: {
+                    Path: ambiguousPath,
+                    Target: 'old',
+                    Replacement: 'new',
+                  },
+                  output: 'Made 1 replacement',
+                },
+              },
+            },
+          };
+          yield {
+            kind: 'record',
+            value: {
+              event: 'step_update',
+              step_update: {
+                conversation_id: 'conv-race',
+                step_index: 3,
+                state: 'ACTIVE',
+                step_type: 'tool',
                 tool_name: 'write_file',
                 tool_info: {
                   name: 'write_file',
@@ -464,7 +509,7 @@ describe('GeminiAntigravityProvider via AgyCliProtocol (HeadlessCliAgentProvider
               event: 'step_update',
               step_update: {
                 conversation_id: 'conv-race',
-                step_index: 2,
+                step_index: 3,
                 state: 'DONE',
                 step_type: 'tool',
                 tool_name: 'write_file',
@@ -496,19 +541,26 @@ describe('GeminiAntigravityProvider via AgyCliProtocol (HeadlessCliAgentProvider
       );
 
       const preSnapshots = chunks.filter((c) => c.type === 'pre_edit_snapshot');
-      expect(preSnapshots).toHaveLength(2);
+      expect(preSnapshots).toHaveLength(3);
 
-      // edit_file reverse-applied Replacement -> Target deterministically (authoritative: true)
+      // Unambiguous single replacement recovers beforeContent while keeping authoritative: false
       expect(preSnapshots[0].preEditSnapshot).toEqual({
         toolUseId: 'conv-race:step-1',
         entries: [{ path: editPath, content: 'export const count = 1;\n', kind: 'update' }],
-        authoritative: true,
+        authoritative: false,
+      });
+
+      // Ambiguous replacement (`old\nnew\n` -> `new\nnew\n`) does NOT invent `old\nold\n`
+      expect(preSnapshots[1].preEditSnapshot).toEqual({
+        toolUseId: 'conv-race:step-2',
+        entries: [{ path: ambiguousPath, content: '', kind: 'update' }],
+        authoritative: false,
       });
 
       // write_file lost the ACTIVE race: does NOT store post-edit content as beforeContent,
       // and leaves authoritative: false so FileSnapshotCache is consulted first.
-      expect(preSnapshots[1].preEditSnapshot).toEqual({
-        toolUseId: 'conv-race:step-2',
+      expect(preSnapshots[2].preEditSnapshot).toEqual({
+        toolUseId: 'conv-race:step-3',
         entries: [{ path: writePath, content: '', kind: 'update' }],
         authoritative: false,
       });
@@ -517,7 +569,154 @@ describe('GeminiAntigravityProvider via AgyCliProtocol (HeadlessCliAgentProvider
     }
   });
 
-  it('bounds inlined attachments and system instructions within Windows command-line limits', () => {
+  it('seeds prior conversation history when continuing an existing Gemini session without a native conversation id', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'agy-seed-'));
+    try {
+      BaseAgentProvider.setTrustChecker(() => ({ trusted: true, mode: 'allow-all' }));
+      GeminiAntigravityProvider.setAgyPathLoader(() => process.execPath);
+
+      const promptsSent: string[] = [];
+      const protocol = new AgyCliProtocol({
+        runNdjson: async function* (opts) {
+          promptsSent.push(opts.args[opts.args.length - 1]);
+          yield {
+            kind: 'record',
+            value: {
+              event: 'init',
+              conversation_id: 'conv-seeded-1',
+              init: { model: 'gemini-4-argon-medium', cwd: dir },
+            },
+          };
+          yield {
+            kind: 'record',
+            value: {
+              event: 'result',
+              result: { conversation_id: 'conv-seeded-1', status: 'SUCCESS', response: 'Reply' },
+            },
+          };
+        },
+      });
+
+      const provider = new GeminiAntigravityProvider({ protocol });
+      await provider.initialize({});
+
+      const priorMessages = [
+        { id: '1', role: 'user' as const, content: 'What is our API port?', timestamp: 1 },
+        { id: '2', role: 'assistant' as const, content: 'The API port is 4100.', timestamp: 2 },
+        { id: '3', role: 'user' as const, content: 'Change it to 4200.', timestamp: 3 },
+      ];
+
+      await collect(
+        provider.sendMessage(
+          'Change it to 4200.',
+          undefined,
+          'legacy-gemini-session',
+          priorMessages,
+          dir,
+        ),
+      );
+
+      expect(promptsSent).toHaveLength(1);
+      expect(promptsSent[0]).toContain('<conversation_history>');
+      expect(promptsSent[0]).toContain('User:\nWhat is our API port?');
+      expect(promptsSent[0]).toContain('Assistant:\nThe API port is 4100.');
+      // Trailing duplicate of the current user message is not duplicated inside <conversation_history>
+      const historyMatch = promptsSent[0].match(/<conversation_history>[\s\S]*?<\/conversation_history>/);
+      expect(historyMatch?.[0]).not.toContain('Change it to 4200.');
+      expect(promptsSent[0].endsWith('\n\nChange it to 4200.')).toBe(true);
+
+      // Second turn uses the native conversation_id and does NOT re-seed <conversation_history>
+      await collect(
+        provider.sendMessage(
+          'Now verify it.',
+          undefined,
+          'legacy-gemini-session',
+          [...priorMessages, { id: '4', role: 'assistant' as const, content: 'Reply', timestamp: 4 }],
+          dir,
+        ),
+      );
+
+      expect(promptsSent).toHaveLength(2);
+      expect(promptsSent[1]).not.toContain('<conversation_history>');
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('delivers SessionOptions.mcpServers to agy mcp_config.json and reports deliveredMcpServerCount', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'agy-mcp-'));
+    try {
+      const mcpConfigPath = join(dir, 'mcp_config.json');
+      writeFileSync(
+        mcpConfigPath,
+        JSON.stringify({
+          mcpServers: {
+            'user-custom': { command: 'node', args: ['custom.js'] },
+            'nimbalyst:stale': { url: 'http://127.0.0.1:9999/mcp' },
+          },
+        }),
+        'utf8',
+      );
+
+      BaseAgentProvider.setTrustChecker(() => ({ trusted: true, mode: 'allow-all' }));
+      GeminiAntigravityProvider.setAgyPathLoader(() => process.execPath);
+      GeminiAntigravityProvider.setMCPConfigLoader(async () => ({
+        'nimbalyst-host': {
+          type: 'sse',
+          url: 'http://127.0.0.1:41001/mcp/host?sessionId=s1',
+          headers: { Authorization: 'Bearer tok-123' },
+        },
+        'local-stdio': {
+          type: 'stdio',
+          command: 'npx',
+          args: ['-y', '@modelcontextprotocol/server-memory'],
+        },
+      }));
+
+      const protocol = new AgyCliProtocol({
+        mcpConfigPath,
+        runNdjson: async function* () {
+          yield {
+            kind: 'record',
+            value: {
+              event: 'init',
+              conversation_id: 'conv-mcp-1',
+              init: { model: 'gemini-4-argon-medium', cwd: dir },
+            },
+          };
+          yield {
+            kind: 'record',
+            value: {
+              event: 'result',
+              result: { conversation_id: 'conv-mcp-1', status: 'SUCCESS', response: 'OK' },
+            },
+          };
+        },
+      });
+
+      const provider = new GeminiAntigravityProvider({ protocol });
+      await provider.initialize({});
+      await collect(provider.sendMessage('spawn child', undefined, 'mcp-session', undefined, dir));
+
+      expect(provider.getInitData()?.mcpServerCount).toBe(2);
+      const written = JSON.parse(readFileSync(mcpConfigPath, 'utf8'));
+      expect(written.mcpServers).toEqual({
+        'user-custom': { command: 'node', args: ['custom.js'] },
+        'nimbalyst:nimbalyst-host': {
+          url: 'http://127.0.0.1:41001/mcp/host?sessionId=s1',
+          headers: { Authorization: 'Bearer tok-123' },
+        },
+        'nimbalyst:local-stdio': {
+          command: 'npx',
+          args: ['-y', '@modelcontextprotocol/server-memory'],
+        },
+      });
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('bounds inlined attachments on Windows, preserves long prompts on POSIX, and fails explicitly with E2BIG instead of truncating', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'agy-cmdline-'));
     try {
       const smallDoc = join(dir, 'small.md');
@@ -551,12 +750,30 @@ describe('GeminiAntigravityProvider via AgyCliProtocol (HeadlessCliAgentProvider
         },
         'Follow project rules carefully.',
         200,
+        'win32',
       );
 
       expect(prompt).toContain('<system_instructions>\nFollow project rules carefully.\n</system_instructions>');
       expect(prompt).toContain('<file name="small.md">\nshort attachment text\n</file>');
       expect(prompt).toContain(`- large.md: ${largeDoc}`);
       expect(prompt.length).toBeLessThanOrEqual(AGY_MAX_COMMAND_LINE_CHARS);
+
+      // Long prompt (35,000 chars) on POSIX is preserved in full without truncation
+      const longSpec = `START-${'a'.repeat(35_000)}-END_REQUIREMENT`;
+      const posixPrompt = formatAgyPromptWithAttachments(
+        { content: longSpec },
+        'System rule.',
+        200,
+        'linux',
+      );
+      expect(posixPrompt.endsWith('-END_REQUIREMENT')).toBe(true);
+      expect(posixPrompt).toContain(longSpec);
+
+      // On Windows, a prompt that itself exceeds the command-line limit throws E2BIG
+      // rather than silently slicing off the final requirements
+      expect(() =>
+        formatAgyPromptWithAttachments({ content: longSpec }, 'System rule.', 200, 'win32'),
+      ).toThrow(/E2BIG/);
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }

@@ -2074,6 +2074,9 @@ app.whenReady().then(async () => {
     CursorAgentProvider.setMCPConfigLoader(
         (workspacePath?: string) => syncHeadlessAgentMcpConfig('cursor-agent', MCP_PROVIDER_IDS.CURSOR, 'Cursor', workspacePath),
     );
+    GeminiAntigravityProvider.setMCPConfigLoader(
+        (workspacePath?: string) => loadEnabledMcpServersFor(MCP_PROVIDER_IDS.GEMINI, 'Gemini', workspacePath),
+    );
 
     // Claude CLI (subscription) launcher shares the Claude Agent MCP filter —
     // the genuine CLI hits the identical MCP handlers as the SDK path (NIM-806).
