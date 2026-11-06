@@ -569,6 +569,121 @@ describe('GeminiAntigravityProvider via AgyCliProtocol (HeadlessCliAgentProvider
     }
   });
 
+  it('reverse-applies lost-race edits only when the hunk is position-bound or unique, and never partially for multi-chunk edits', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'agy-reverse-'));
+    try {
+      const rangedPath = join(dir, 'ranged.ts');
+      const multiPath = join(dir, 'multi.ts');
+      const nestedPath = join(dir, 'nested.ts');
+      // Every file is already in its post-edit state before ACTIVE is consumed.
+      // `x = 2;` appears twice; only StartLine/EndLine can say which one was edited.
+      writeFileSync(rangedPath, 'x = 2;\ny = 1;\nx = 2;\n', 'utf8');
+      // First chunk is unique, second chunk is ambiguous (`new` twice).
+      writeFileSync(multiPath, 'beta\nnew\nnew\n', 'utf8');
+      // Replacement is a substring of the target, so reversal cannot be trusted.
+      writeFileSync(nestedPath, 'foo\n', 'utf8');
+
+      const toolStep = (
+        stepIndex: number,
+        state: 'ACTIVE' | 'DONE',
+        name: string,
+        parameters: Record<string, unknown>,
+      ) => ({
+        kind: 'record' as const,
+        value: {
+          event: 'step_update',
+          step_update: {
+            conversation_id: 'conv-reverse',
+            step_index: stepIndex,
+            state,
+            step_type: 'tool',
+            tool_name: name,
+            tool_info: { name, parameters, ...(state === 'DONE' ? { output: 'ok' } : {}) },
+          },
+        },
+      });
+      const rangedParams = {
+        Path: rangedPath,
+        Target: 'x = 1;',
+        Replacement: 'x = 2;',
+        StartLine: 3,
+        EndLine: 3,
+      };
+      const multiParams = {
+        TargetFile: multiPath,
+        ReplacementChunks: [
+          { TargetContent: 'alpha', ReplacementContent: 'beta' },
+          { TargetContent: 'old', ReplacementContent: 'new' },
+        ],
+      };
+      const nestedParams = { Path: nestedPath, Target: 'foo bar', Replacement: 'foo' };
+
+      BaseAgentProvider.setTrustChecker(() => ({ trusted: true, mode: 'allow-all' }));
+      GeminiAntigravityProvider.setAgyPathLoader(() => process.execPath);
+
+      const protocol = new AgyCliProtocol({
+        runNdjson: async function* () {
+          yield {
+            kind: 'record',
+            value: {
+              event: 'init',
+              conversation_id: 'conv-reverse',
+              init: { model: 'gemini-3.8-flash-medium', cwd: dir },
+            },
+          };
+          yield toolStep(1, 'ACTIVE', 'edit_file', rangedParams);
+          yield toolStep(1, 'DONE', 'edit_file', rangedParams);
+          yield toolStep(2, 'ACTIVE', 'multi_replace_file_content', multiParams);
+          yield toolStep(2, 'DONE', 'multi_replace_file_content', multiParams);
+          yield toolStep(3, 'ACTIVE', 'edit_file', nestedParams);
+          yield toolStep(3, 'DONE', 'edit_file', nestedParams);
+          yield {
+            kind: 'record',
+            value: {
+              event: 'result',
+              result: { conversation_id: 'conv-reverse', status: 'SUCCESS', response: 'Done' },
+            },
+          };
+        },
+      });
+
+      const provider = new GeminiAntigravityProvider({ protocol });
+      await provider.initialize({});
+      const chunks = await collect(
+        provider.sendMessage('apply edits', undefined, 'nim-reverse', undefined, dir),
+      );
+
+      const preSnapshots = chunks.filter((c) => c.type === 'pre_edit_snapshot');
+      expect(preSnapshots).toHaveLength(3);
+
+      // Duplicate replacement text, but StartLine/EndLine pins it to line 3:
+      // only that occurrence is reversed, the first `x = 2;` is left alone.
+      expect(preSnapshots[0].preEditSnapshot).toEqual({
+        toolUseId: 'conv-reverse:step-1',
+        entries: [{ path: rangedPath, content: 'x = 2;\ny = 1;\nx = 1;\n', kind: 'update' }],
+        authoritative: false,
+      });
+
+      // One ambiguous chunk aborts the whole multi-chunk reversal rather than
+      // producing a baseline where only `beta` -> `alpha` was undone.
+      expect(preSnapshots[1].preEditSnapshot).toEqual({
+        toolUseId: 'conv-reverse:step-2',
+        entries: [{ path: multiPath, content: '', kind: 'update' }],
+        authoritative: false,
+      });
+
+      // `foo bar` -> `foo`: the replacement is inside the target, so reversal
+      // would loop on itself; fall back to the host cache.
+      expect(preSnapshots[2].preEditSnapshot).toEqual({
+        toolUseId: 'conv-reverse:step-3',
+        entries: [{ path: nestedPath, content: '', kind: 'update' }],
+        authoritative: false,
+      });
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it('seeds prior conversation history when continuing an existing Gemini session without a native conversation id', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'agy-seed-'));
     try {
