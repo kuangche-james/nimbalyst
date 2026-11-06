@@ -11,7 +11,10 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { BaseAgentProvider } from '../../BaseAgentProvider';
 import { GeminiAntigravityProvider } from '../../GeminiAntigravityProvider';
 import {
+  AGY_INLINE_DOCUMENT_BUDGET,
+  AGY_MAX_COMMAND_LINE_CHARS,
   AgyCliProtocol,
+  formatAgyPromptWithAttachments,
   mapAgyRecord,
   normalizeAgyToolArguments,
   normalizeAgyUsage,
@@ -289,7 +292,7 @@ describe('GeminiAntigravityProvider via AgyCliProtocol (HeadlessCliAgentProvider
         provider.sendMessage('update hello.txt', undefined, 'nim-session-1', undefined, dir),
       );
 
-      expect(capturedArgs).toEqual([
+      expect(capturedArgs.slice(0, -1)).toEqual([
         '--print',
         '--output-format',
         'stream-json',
@@ -297,8 +300,10 @@ describe('GeminiAntigravityProvider via AgyCliProtocol (HeadlessCliAgentProvider
         'gemini-4-argon-medium',
         '--dangerously-skip-permissions',
         '--',
-        'update hello.txt',
       ]);
+      const sentPrompt = capturedArgs[capturedArgs.length - 1];
+      expect(sentPrompt).toContain('<system_instructions>');
+      expect(sentPrompt.endsWith('\n\nupdate hello.txt')).toBe(true);
 
       // Verify conversation_id was persisted for multi-turn resumption
       expect(provider.getProviderSessionData('nim-session-1')).toEqual({
@@ -306,23 +311,42 @@ describe('GeminiAntigravityProvider via AgyCliProtocol (HeadlessCliAgentProvider
       });
       expect(provider.getInitData()?.model).toBe('gemini-4-argon-medium');
 
-      // Verify pre/post edit snapshots were emitted after tool_call and before complete
+      // Verify pre/post edit snapshots and terminal tool_call result were emitted in order
       const announceIdx = chunks.findIndex(
         (c) => c.type === 'tool_call' && c.toolCall?.result === undefined,
       );
       const preIdx = chunks.findIndex((c) => c.type === 'pre_edit_snapshot');
       const postIdx = chunks.findIndex((c) => c.type === 'post_edit_snapshot');
+      const resultIdx = chunks.findIndex(
+        (c) => c.type === 'tool_call' && c.toolCall?.result !== undefined,
+      );
       const completeIdx = chunks.findIndex((c) => c.type === 'complete');
 
       expect(announceIdx).toBeGreaterThanOrEqual(0);
       expect(announceIdx).toBeLessThan(preIdx);
       expect(preIdx).toBeLessThan(postIdx);
-      expect(postIdx).toBeLessThan(completeIdx);
+      expect(postIdx).toBeLessThan(resultIdx);
+      expect(resultIdx).toBeLessThan(completeIdx);
+
+      expect(chunks[resultIdx].toolCall).toMatchObject({
+        id: 'conv-uuid-1:step-1',
+        name: 'write_file',
+        arguments: {
+          Path: targetFile,
+          Content: 'after\n',
+          file_path: targetFile,
+          path: targetFile,
+        },
+        result: {
+          success: true,
+          output: 'Updated hello.txt',
+        },
+      });
 
       expect(chunks[preIdx].preEditSnapshot).toEqual({
         toolUseId: 'conv-uuid-1:step-1',
         entries: [{ path: targetFile, content: 'before\n', kind: 'update' }],
-        authoritative: true,
+        authoritative: false,
       });
       expect(chunks[postIdx].postEditSnapshot).toEqual({
         toolUseId: 'conv-uuid-1:step-1',
@@ -344,6 +368,195 @@ describe('GeminiAntigravityProvider via AgyCliProtocol (HeadlessCliAgentProvider
         provider.sendMessage('follow up', undefined, 'nim-session-1', undefined, dir),
       );
       expect(capturedArgs.slice(0, 2)).toEqual(['--conversation', 'conv-uuid-1']);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('reconstructs pre-edit baseline when edit_file writes before ACTIVE is consumed, and avoids recording post-edit content for write_file', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'agy-race-'));
+    try {
+      const editPath = join(dir, 'edited.ts');
+      const writePath = join(dir, 'overwritten.ts');
+      // Both files have ALREADY been modified on disk before ACTIVE arrives
+      writeFileSync(editPath, 'export const count = 2;\n', 'utf8');
+      writeFileSync(writePath, 'brand new content\n', 'utf8');
+
+      BaseAgentProvider.setTrustChecker(() => ({ trusted: true, mode: 'allow-all' }));
+      GeminiAntigravityProvider.setAgyPathLoader(() => process.execPath);
+
+      const protocol = new AgyCliProtocol({
+        runNdjson: async function* () {
+          yield {
+            kind: 'record',
+            value: {
+              event: 'init',
+              conversation_id: 'conv-race',
+              init: { model: 'gemini-3.8-flash-medium', cwd: dir },
+            },
+          };
+          yield {
+            kind: 'record',
+            value: {
+              event: 'step_update',
+              step_update: {
+                conversation_id: 'conv-race',
+                step_index: 1,
+                state: 'ACTIVE',
+                step_type: 'tool',
+                tool_name: 'edit_file',
+                tool_info: {
+                  name: 'edit_file',
+                  parameters: {
+                    Path: editPath,
+                    Target: 'export const count = 1;',
+                    Replacement: 'export const count = 2;',
+                  },
+                },
+              },
+            },
+          };
+          yield {
+            kind: 'record',
+            value: {
+              event: 'step_update',
+              step_update: {
+                conversation_id: 'conv-race',
+                step_index: 1,
+                state: 'DONE',
+                step_type: 'tool',
+                tool_name: 'edit_file',
+                tool_info: {
+                  name: 'edit_file',
+                  parameters: {
+                    Path: editPath,
+                    Target: 'export const count = 1;',
+                    Replacement: 'export const count = 2;',
+                  },
+                  output: 'Made 1 replacement',
+                },
+              },
+            },
+          };
+          yield {
+            kind: 'record',
+            value: {
+              event: 'step_update',
+              step_update: {
+                conversation_id: 'conv-race',
+                step_index: 2,
+                state: 'ACTIVE',
+                step_type: 'tool',
+                tool_name: 'write_file',
+                tool_info: {
+                  name: 'write_file',
+                  parameters: {
+                    Path: writePath,
+                    Content: 'brand new content\n',
+                  },
+                },
+              },
+            },
+          };
+          yield {
+            kind: 'record',
+            value: {
+              event: 'step_update',
+              step_update: {
+                conversation_id: 'conv-race',
+                step_index: 2,
+                state: 'DONE',
+                step_type: 'tool',
+                tool_name: 'write_file',
+                tool_info: {
+                  name: 'write_file',
+                  parameters: {
+                    Path: writePath,
+                    Content: 'brand new content\n',
+                  },
+                  output: 'Created file',
+                },
+              },
+            },
+          };
+          yield {
+            kind: 'record',
+            value: {
+              event: 'result',
+              result: { conversation_id: 'conv-race', status: 'SUCCESS', response: 'Done' },
+            },
+          };
+        },
+      });
+
+      const provider = new GeminiAntigravityProvider({ protocol });
+      await provider.initialize({});
+      const chunks = await collect(
+        provider.sendMessage('apply edits', undefined, 'nim-race', undefined, dir),
+      );
+
+      const preSnapshots = chunks.filter((c) => c.type === 'pre_edit_snapshot');
+      expect(preSnapshots).toHaveLength(2);
+
+      // edit_file reverse-applied Replacement -> Target deterministically (authoritative: true)
+      expect(preSnapshots[0].preEditSnapshot).toEqual({
+        toolUseId: 'conv-race:step-1',
+        entries: [{ path: editPath, content: 'export const count = 1;\n', kind: 'update' }],
+        authoritative: true,
+      });
+
+      // write_file lost the ACTIVE race: does NOT store post-edit content as beforeContent,
+      // and leaves authoritative: false so FileSnapshotCache is consulted first.
+      expect(preSnapshots[1].preEditSnapshot).toEqual({
+        toolUseId: 'conv-race:step-2',
+        entries: [{ path: writePath, content: '', kind: 'update' }],
+        authoritative: false,
+      });
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('bounds inlined attachments and system instructions within Windows command-line limits', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'agy-cmdline-'));
+    try {
+      const smallDoc = join(dir, 'small.md');
+      const largeDoc = join(dir, 'large.md');
+      writeFileSync(smallDoc, 'short attachment text', 'utf8');
+      writeFileSync(largeDoc, 'x'.repeat(AGY_INLINE_DOCUMENT_BUDGET + 2048), 'utf8');
+
+      const prompt = formatAgyPromptWithAttachments(
+        {
+          content: 'Summarize these files',
+          attachments: [
+            {
+              id: '1',
+              type: 'document',
+              filename: 'small.md',
+              filepath: smallDoc,
+              mimeType: 'text/markdown',
+              size: 21,
+              addedAt: 0,
+            },
+            {
+              id: '2',
+              type: 'document',
+              filename: 'large.md',
+              filepath: largeDoc,
+              mimeType: 'text/markdown',
+              size: AGY_INLINE_DOCUMENT_BUDGET + 2048,
+              addedAt: 0,
+            },
+          ],
+        },
+        'Follow project rules carefully.',
+        200,
+      );
+
+      expect(prompt).toContain('<system_instructions>\nFollow project rules carefully.\n</system_instructions>');
+      expect(prompt).toContain('<file name="small.md">\nshort attachment text\n</file>');
+      expect(prompt).toContain(`- large.md: ${largeDoc}`);
+      expect(prompt.length).toBeLessThanOrEqual(AGY_MAX_COMMAND_LINE_CHARS);
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }

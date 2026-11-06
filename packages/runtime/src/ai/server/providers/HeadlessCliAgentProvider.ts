@@ -331,6 +331,7 @@ export abstract class HeadlessCliAgentProvider extends BaseAgentProvider {
       };
 
       const transcriptAdapter = new AgentProtocolTranscriptAdapter(null, sessionId ?? '');
+      const pendingToolArgs = new Map<string, Record<string, unknown>>();
       transcriptAdapter.userMessage(
         prompt,
         documentContext?.mode === 'planning' ? 'planning' : 'agent',
@@ -379,8 +380,29 @@ export abstract class HeadlessCliAgentProvider extends BaseAgentProvider {
               yield { type: 'text', content: item.text };
               break;
             case 'tool_call':
+              if (item.toolCall.id && item.toolCall.arguments) {
+                pendingToolArgs.set(item.toolCall.id, item.toolCall.arguments);
+              }
               yield { type: 'tool_call', toolCall: item.toolCall };
               break;
+            case 'tool_result': {
+              const toolArgs = item.toolResult.id
+                ? pendingToolArgs.get(item.toolResult.id)
+                : undefined;
+              if (item.toolResult.id) {
+                pendingToolArgs.delete(item.toolResult.id);
+              }
+              yield {
+                type: 'tool_call',
+                toolCall: {
+                  id: item.toolResult.id,
+                  name: item.toolResult.name,
+                  ...(toolArgs ? { arguments: toolArgs } : {}),
+                  result: item.toolResult.result,
+                },
+              };
+              break;
+            }
             case 'complete':
               if (sessionId && fullText) {
                 await this.storeAssistantResponse(sessionId, fullText);

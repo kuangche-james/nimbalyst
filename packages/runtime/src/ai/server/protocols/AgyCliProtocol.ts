@@ -46,11 +46,20 @@ const AGY_EDIT_TOOL_NAMES = new Set([
   'multi_replace_file_content',
 ]);
 
-export const AGY_INLINE_DOCUMENT_BUDGET = 64 * 1024;
+export const AGY_INLINE_DOCUMENT_BUDGET = 16_000;
+
+/**
+ * Windows `CreateProcessW` caps the entire command line (executable + flags +
+ * positional prompt) at 32,767 UTF-16 code units. Bound the assembled command
+ * line conservatively at 28,000 characters so quoting/escaping and long paths
+ * never prevent a turn from starting on Windows.
+ */
+export const AGY_MAX_COMMAND_LINE_CHARS = 28_000;
 
 interface AgySessionRaw extends Record<string, unknown> {
   workspacePath: string;
   model?: string;
+  systemPrompt?: string;
 }
 
 export interface AgyCliProtocolDeps {
@@ -81,6 +90,7 @@ export class AgyCliProtocol implements AgentProtocol {
     const raw: AgySessionRaw = {
       workspacePath: options.workspacePath,
       model: options.model,
+      systemPrompt: options.systemPrompt,
     };
     return {
       id: '',
@@ -91,13 +101,22 @@ export class AgyCliProtocol implements AgentProtocol {
   }
 
   async resumeSession(sessionId: string, options?: SessionOptions): Promise<ProtocolSession> {
-    const merged = options ?? this.sessions.get(sessionId) ?? { workspacePath: process.cwd() };
+    const previous = this.sessions.get(sessionId);
+    const merged: SessionOptions = {
+      workspacePath: options?.workspacePath ?? previous?.workspacePath ?? process.cwd(),
+      model: options?.model ?? previous?.model,
+      systemPrompt: options?.systemPrompt ?? previous?.systemPrompt,
+      mcpServers: options?.mcpServers ?? previous?.mcpServers,
+      permissionMode: options?.permissionMode ?? previous?.permissionMode,
+      raw: options?.raw ?? previous?.raw,
+    };
     if (sessionId) {
       this.sessions.set(sessionId, merged);
     }
     const raw: AgySessionRaw = {
       workspacePath: merged.workspacePath,
       model: merged.model,
+      systemPrompt: merged.systemPrompt,
     };
     return {
       id: sessionId,
@@ -132,13 +151,24 @@ export class AgyCliProtocol implements AgentProtocol {
     }
     // HeadlessCliAgentProvider gates the turn up front on workspace trust.
     args.push('--dangerously-skip-permissions');
-    args.push('--', formatAgyPromptWithAttachments(message));
 
-    let sawResult = false;
-    let stderrTail = '';
+    const commandLineOverhead =
+      this.executablePath.length +
+      args.reduce((sum, arg) => sum + arg.length + 3, 6);
+    args.push(
+      '--',
+      formatAgyPromptWithAttachments(message, raw.systemPrompt, commandLineOverhead),
+    );
+
     const pendingEdits = new Map<
       string,
-      { absPath: string; beforeContent: string | null; fallbackAfterContent?: string }
+      {
+        absPath: string;
+        toolName: string;
+        params: Record<string, unknown>;
+        beforeContent: string | null;
+        fallbackAfterContent?: string;
+      }
     >();
 
     for await (const item of this.runNdjsonImpl({
@@ -157,7 +187,11 @@ export class AgyCliProtocol implements AgentProtocol {
         const convId = typeof record.conversation_id === 'string' ? record.conversation_id.trim() : '';
         if (convId) {
           session.id = convId;
-          this.sessions.set(convId, { workspacePath: raw.workspacePath, model: raw.model });
+          this.sessions.set(convId, {
+            workspacePath: raw.workspacePath,
+            model: raw.model,
+            systemPrompt: raw.systemPrompt,
+          });
         }
         const initObj =
           record.init && typeof record.init === 'object' && !Array.isArray(record.init)
@@ -169,7 +203,6 @@ export class AgyCliProtocol implements AgentProtocol {
       }
 
       if (eventKind === 'result') {
-        sawResult = true;
         const resObj =
           record.result && typeof record.result === 'object' && !Array.isArray(record.result)
             ? (record.result as Record<string, unknown>)
@@ -182,7 +215,11 @@ export class AgyCliProtocol implements AgentProtocol {
               : '';
         if (convId && !session.id) {
           session.id = convId;
-          this.sessions.set(convId, { workspacePath: raw.workspacePath, model: raw.model });
+          this.sessions.set(convId, {
+            workspacePath: raw.workspacePath,
+            model: raw.model,
+            systemPrompt: raw.systemPrompt,
+          });
         }
       }
 
@@ -250,7 +287,13 @@ export class AgyCliProtocol implements AgentProtocol {
                     : typeof params.content === 'string'
                       ? params.content
                       : undefined;
-              pendingEdits.set(callId, { absPath, beforeContent, fallbackAfterContent });
+              pendingEdits.set(callId, {
+                absPath,
+                toolName,
+                params,
+                beforeContent,
+                fallbackAfterContent,
+              });
             } else if (state === 'DONE') {
               const pending = pendingEdits.get(callId);
               if (pending) {
@@ -267,13 +310,16 @@ export class AgyCliProtocol implements AgentProtocol {
                   afterContent = pending.fallbackAfterContent;
                 }
                 if (typeof afterContent === 'string') {
+                  const mergedParams =
+                    Object.keys(params).length > 0 ? { ...pending.params, ...params } : pending.params;
                   editChanges = [
-                    {
-                      path: pending.absPath,
-                      kind: pending.beforeContent === null ? 'add' : 'update',
-                      beforeContent: pending.beforeContent ?? '',
+                    buildAgyEditChange(
+                      pending.absPath,
+                      pending.toolName || toolName,
+                      mergedParams,
+                      pending.beforeContent,
                       afterContent,
-                    },
+                    ),
                   ];
                 }
               }
@@ -299,11 +345,138 @@ export class AgyCliProtocol implements AgentProtocol {
   }
 }
 
-function formatAgyPromptWithAttachments(message: ProtocolMessage): string {
-  const attachments = message.attachments?.filter((a) => a.filepath);
-  if (!attachments?.length) return message.content;
+function buildAgyEditChange(
+  absPath: string,
+  toolName: string,
+  params: Record<string, unknown>,
+  observedBefore: string | null,
+  afterContent: string,
+): AgyEditChange {
+  if (observedBefore === null) {
+    return {
+      path: absPath,
+      kind: 'add',
+      beforeContent: '',
+      afterContent,
+      authoritative: false,
+    };
+  }
 
-  let remainingInlineBudget = AGY_INLINE_DOCUMENT_BUDGET;
+  if (observedBefore !== afterContent) {
+    return {
+      path: absPath,
+      kind: 'update',
+      beforeContent: observedBefore,
+      afterContent,
+      authoritative: false,
+    };
+  }
+
+  // `observedBefore === afterContent`: the CLI already wrote the file before
+  // the parent process consumed the `ACTIVE` stdout line. For in-place edit
+  // tools (`edit_file`, `replace_file_content`, `multi_replace_file_content`),
+  // reverse-apply the replacement hunk(s) against `afterContent` to recover
+  // the exact pre-edit baseline deterministically.
+  const recovered = tryReverseApplyAgyEdit(toolName, params, afterContent);
+  if (recovered !== null && recovered !== afterContent) {
+    return {
+      path: absPath,
+      kind: 'update',
+      beforeContent: recovered,
+      afterContent,
+      authoritative: true,
+    };
+  }
+
+  // Full-file write (`write_file`) where the `ACTIVE` disk read lost the race:
+  // do NOT report `afterContent` as `beforeContent`. Leave `beforeContent`
+  // empty and `authoritative: false` so `MessageStreamingHandler` consults
+  // `FileSnapshotCache` for existing files and falls back to `''` for newly
+  // created files.
+  return {
+    path: absPath,
+    kind: 'update',
+    beforeContent: '',
+    afterContent,
+    authoritative: false,
+  };
+}
+
+function tryReverseApplyAgyEdit(
+  toolName: string,
+  params: Record<string, unknown>,
+  afterContent: string,
+): string | null {
+  if (toolName === 'edit_file' || toolName === 'replace_file_content') {
+    const target =
+      typeof params.Target === 'string'
+        ? params.Target
+        : typeof params.TargetContent === 'string'
+          ? params.TargetContent
+          : undefined;
+    const replacement =
+      typeof params.Replacement === 'string'
+        ? params.Replacement
+        : typeof params.ReplacementContent === 'string'
+          ? params.ReplacementContent
+          : undefined;
+    if (
+      target !== undefined &&
+      replacement !== undefined &&
+      replacement.length > 0 &&
+      target !== replacement &&
+      afterContent.includes(replacement)
+    ) {
+      return afterContent.split(replacement).join(target);
+    }
+  }
+
+  if (toolName === 'multi_replace_file_content' && Array.isArray(params.ReplacementChunks)) {
+    let current = afterContent;
+    let changed = false;
+    for (let i = params.ReplacementChunks.length - 1; i >= 0; i--) {
+      const chunk = params.ReplacementChunks[i];
+      if (!chunk || typeof chunk !== 'object') continue;
+      const rec = chunk as Record<string, unknown>;
+      const target = typeof rec.TargetContent === 'string' ? rec.TargetContent : undefined;
+      const replacement =
+        typeof rec.ReplacementContent === 'string' ? rec.ReplacementContent : undefined;
+      if (
+        target !== undefined &&
+        replacement !== undefined &&
+        replacement.length > 0 &&
+        target !== replacement &&
+        current.includes(replacement)
+      ) {
+        current = current.replace(replacement, () => target);
+        changed = true;
+      }
+    }
+    if (changed) return current;
+  }
+
+  return null;
+}
+
+export function formatAgyPromptWithAttachments(
+  message: ProtocolMessage,
+  systemPrompt?: string,
+  commandLineOverhead = 256,
+): string {
+  const maxPromptChars = Math.max(4_096, AGY_MAX_COMMAND_LINE_CHARS - commandLineOverhead);
+  const trimmedSystem = systemPrompt?.trim() ?? '';
+  const systemSection = trimmedSystem
+    ? `<system_instructions>\n${trimmedSystem}\n</system_instructions>`
+    : '';
+
+  const attachments = message.attachments?.filter((a) => a.filepath) ?? [];
+  const reservedChars =
+    message.content.length + (systemSection ? systemSection.length + 2 : 0) + 256;
+  let remainingInlineBudget = Math.min(
+    AGY_INLINE_DOCUMENT_BUDGET,
+    Math.max(0, maxPromptChars - reservedChars),
+  );
+
   const inlinedDocuments: string[] = [];
   const referencedPaths: string[] = [];
 
@@ -312,9 +485,11 @@ function formatAgyPromptWithAttachments(message: ProtocolMessage): string {
     if (attachment.type === 'document') {
       try {
         const text = readFileSync(filepath, 'utf8');
-        if (Buffer.byteLength(text, 'utf8') <= remainingInlineBudget) {
-          remainingInlineBudget -= Buffer.byteLength(text, 'utf8');
-          inlinedDocuments.push(`<file name="${attachment.filename}">\n${text}\n</file>`);
+        const wrapped = `<file name="${attachment.filename}">\n${text}\n</file>`;
+        const byteLen = Buffer.byteLength(text, 'utf8');
+        if (byteLen <= remainingInlineBudget && wrapped.length <= remainingInlineBudget) {
+          remainingInlineBudget -= Math.max(byteLen, wrapped.length);
+          inlinedDocuments.push(wrapped);
         } else {
           referencedPaths.push(`- ${attachment.filename}: ${filepath}`);
         }
@@ -338,10 +513,28 @@ function formatAgyPromptWithAttachments(message: ProtocolMessage): string {
     }
   }
 
-  const sections = [message.content];
-  if (inlinedDocuments.length > 0) sections.push(inlinedDocuments.join('\n\n'));
-  if (referencedPaths.length > 0) sections.push(`Attached files:\n${referencedPaths.join('\n')}`);
-  return sections.join('\n\n');
+  const userSections = [message.content];
+  if (inlinedDocuments.length > 0) userSections.push(inlinedDocuments.join('\n\n'));
+  if (referencedPaths.length > 0) userSections.push(`Attached files:\n${referencedPaths.join('\n')}`);
+  const userBody = userSections.join('\n\n');
+
+  if (!systemSection) {
+    return userBody.length <= maxPromptChars ? userBody : userBody.slice(0, maxPromptChars);
+  }
+
+  const combined = `${systemSection}\n\n${userBody}`;
+  if (combined.length <= maxPromptChars) {
+    return combined;
+  }
+
+  // Keep the user's message and attachment references intact first; fit as much
+  // of the system instructions as the Windows command-line budget allows.
+  const availableForSystem = maxPromptChars - userBody.length - 40;
+  if (availableForSystem > 64) {
+    const boundedSystem = `<system_instructions>\n${trimmedSystem.slice(0, availableForSystem)}\n</system_instructions>`;
+    return `${boundedSystem}\n\n${userBody}`;
+  }
+  return userBody.length <= maxPromptChars ? userBody : userBody.slice(0, maxPromptChars);
 }
 
 function stripProviderPrefix(model: string | undefined): string | undefined {

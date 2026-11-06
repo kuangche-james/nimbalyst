@@ -22,8 +22,16 @@ export type AgyTokenUsage = NonNullable<ProtocolEvent['usage']>;
 export interface AgyEditChange {
   path: string;
   kind: 'add' | 'update';
-  beforeContent: string;
+  beforeContent?: string;
   afterContent: string;
+  /**
+   * True only when `beforeContent` was deterministically reconstructed (e.g.
+   * by reverse-applying `edit_file`'s `Replacement -> Target` against
+   * `afterContent`). Leave false/undefined for `ACTIVE` disk reads, which can
+   * race with the CLI writing the file and must allow `MessageStreamingHandler`
+   * to consult `FileSnapshotCache` first.
+   */
+  authoritative?: boolean;
 }
 
 /**

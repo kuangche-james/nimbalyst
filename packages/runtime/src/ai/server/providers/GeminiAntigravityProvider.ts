@@ -187,11 +187,19 @@ export class GeminiAntigravityProvider extends HeadlessCliAgentProvider {
     super.destroy();
   }
 
+  private turnSystemPromptOverride: string | undefined;
+
   /**
-   * Emit authoritative `pre_edit_snapshot` / `post_edit_snapshot` chunks when
-   * `AgyCliProtocol` attaches full-file `changes` onto an edit tool result,
-   * while keeping `getFileChangeFidelity() === 'tool-args'` so the filesystem
-   * watcher remains active for shell-driven deletes and moves.
+   * Emit `pre_edit_snapshot` / `post_edit_snapshot` chunks when `AgyCliProtocol`
+   * attaches full-file `changes` onto an edit tool result, while keeping
+   * `getFileChangeFidelity() === 'tool-args'` so the filesystem watcher remains
+   * active for shell-driven deletes and moves.
+   *
+   * `authoritative` is left `false` unless `AgyCliProtocol` deterministically
+   * reconstructed `beforeContent` by reverse-applying `edit_file`'s replacement
+   * hunks. Leaving disk-read snapshots non-authoritative ensures
+   * `MessageStreamingHandler` consults `FileSnapshotCache` first when the CLI
+   * writes a file before the parent consumes the `ACTIVE` stdout record.
    */
   protected override *buildEditSnapshots(event: ProtocolEvent): Generator<StreamChunk> {
     if (event.type !== 'tool_result') return;
@@ -204,6 +212,7 @@ export class GeminiAntigravityProvider extends HeadlessCliAgentProvider {
     const toolUseId = event.toolResult?.id ?? `${this.getProviderName()}-edit-${changes.length}`;
     const preEntries: Array<{ path: string; content: string; kind?: string }> = [];
     const postEntries: Array<{ path: string; content: string; kind?: string }> = [];
+    let allAuthoritative = true;
 
     for (const raw of changes) {
       const change = raw as {
@@ -211,12 +220,16 @@ export class GeminiAntigravityProvider extends HeadlessCliAgentProvider {
         kind?: unknown;
         beforeContent?: unknown;
         afterContent?: unknown;
+        authoritative?: unknown;
       };
       if (typeof change.path !== 'string' || !change.path) continue;
       const kind = typeof change.kind === 'string' ? change.kind : 'update';
 
       if (typeof change.beforeContent === 'string') {
         preEntries.push({ path: change.path, content: change.beforeContent, kind });
+        if (change.authoritative !== true) {
+          allAuthoritative = false;
+        }
       }
       if (kind !== 'delete' && typeof change.afterContent === 'string') {
         postEntries.push({ path: change.path, content: change.afterContent, kind });
@@ -229,7 +242,7 @@ export class GeminiAntigravityProvider extends HeadlessCliAgentProvider {
         preEditSnapshot: {
           toolUseId,
           entries: preEntries,
-          authoritative: true,
+          authoritative: allAuthoritative,
         },
       };
     }
@@ -242,6 +255,17 @@ export class GeminiAntigravityProvider extends HeadlessCliAgentProvider {
         },
       };
     }
+  }
+
+  protected override buildSystemPrompt(
+    documentContext?: DocumentContext,
+    sessionDirective?: string,
+    hasOutOfBandNaming: boolean = false,
+  ): string {
+    const base = super.buildSystemPrompt(documentContext, sessionDirective, hasOutOfBandNaming);
+    const extra = this.turnSystemPromptOverride?.trim();
+    if (!extra) return base;
+    return base ? `${base}\n\n${extra}` : extra;
   }
 
   override async *sendMessage(
@@ -268,14 +292,19 @@ export class GeminiAntigravityProvider extends HeadlessCliAgentProvider {
       return;
     }
 
-    yield* super.sendMessage(
-      message,
-      documentContext,
-      sessionId,
-      messages,
-      workspacePath,
-      attachments,
-    );
+    this.turnSystemPromptOverride = systemPrompt;
+    try {
+      yield* super.sendMessage(
+        message,
+        documentContext,
+        sessionId,
+        messages,
+        workspacePath,
+        attachments,
+      );
+    } finally {
+      this.turnSystemPromptOverride = undefined;
+    }
   }
 
   private async *sendMessageViaServerManager(
