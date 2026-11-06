@@ -719,14 +719,21 @@ export class GeminiAntigravityProvider extends HeadlessCliAgentProvider {
       });
       const parsed = parseAgyModelList(output);
       if (parsed.length > 0) {
+        console.log(`[Gemini] agy models at ${command} returned ${parsed.length} Gemini model(s)`);
         return parsed.map((m) => ({
           id: `${GEMINI_ANTIGRAVITY_PROVIDER}:${m.key}`,
           name: m.displayName,
           provider: GEMINI_ANTIGRAVITY_PROVIDER,
         }));
       }
-    } catch {
-      // Fall through to seed/hub catalog.
+      console.warn(
+        `[Gemini] agy models at ${command} listed no gemini-* models; using the seed catalog. Output head: ${JSON.stringify(output.slice(0, 300))}`,
+      );
+    } catch (error) {
+      // Fall through to seed/hub catalog, but say so: a silent fallback here
+      // is indistinguishable from the CLI working (#1653).
+      const detail = error instanceof Error ? error.message : String(error);
+      console.warn(`[Gemini] agy models at ${command} failed (${detail}); using the seed catalog`);
     }
 
     const models = await discoverGeminiModels(AntigravityServerManager.shared());
