@@ -76,14 +76,41 @@ export const AGY_STARTUP_GATE_TIMEOUT_MS = 15_000;
  */
 let agyStartupGate: Promise<void> = Promise.resolve();
 
-function acquireAgyStartupGate(): Promise<() => void> {
+function agyAbortError(): Error {
+  const err = new Error('Antigravity turn was cancelled before the CLI started');
+  err.name = 'AbortError';
+  return err;
+}
+
+/**
+ * Resolves with the release function once every earlier holder has released.
+ * Rejects with an `AbortError` if `signal` is already aborted or aborts while
+ * waiting; the slot this call reserved is released either way, so a cancelled
+ * turn never blocks the turns queued behind it.
+ */
+function acquireAgyStartupGate(signal?: AbortSignal): Promise<() => void> {
+  if (signal?.aborted) return Promise.reject(agyAbortError());
   let release!: () => void;
   const held = new Promise<void>((resolve) => {
     release = resolve;
   });
   const previous = agyStartupGate;
   agyStartupGate = previous.then(() => held);
-  return previous.then(() => release);
+  return new Promise<() => void>((resolve, reject) => {
+    const onAbort = () => {
+      release();
+      reject(agyAbortError());
+    };
+    signal?.addEventListener('abort', onAbort, { once: true });
+    void previous.then(() => {
+      signal?.removeEventListener('abort', onAbort);
+      if (signal?.aborted) {
+        onAbort();
+        return;
+      }
+      resolve(release);
+    });
+  });
 }
 
 export interface AgyMcpServerEntry {
@@ -234,7 +261,12 @@ export class AgyCliProtocol implements AgentProtocol {
     // writes land before either CLI reads, and both processes get the second
     // session's endpoints. Hold the gate from the write until this process
     // proves it has started (its first stdout record) or the timeout lapses.
-    const releaseGate = await acquireAgyStartupGate();
+    //
+    // A turn cancelled while it waits here must not write its config or
+    // spawn: `runHeadlessNdjson` only listens for a future abort, so a child
+    // started with an already-aborted signal would run the cancelled prompt
+    // until the first event is consumed.
+    const releaseGate = await acquireAgyStartupGate(message.abortSignal);
     let gateHeld = true;
     const releaseStartupGate = () => {
       if (!gateHeld) return;
@@ -246,6 +278,10 @@ export class AgyCliProtocol implements AgentProtocol {
 
     try {
       await this.syncMcpServersImpl(normalizeAgyMcpServers(raw.mcpServers));
+      if (message.abortSignal?.aborted) {
+        // Cancelled during the config write: do not start the process.
+        throw agyAbortError();
+      }
     } catch (error) {
       releaseStartupGate();
       clearTimeout(gateTimer);

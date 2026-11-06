@@ -888,6 +888,81 @@ describe('GeminiAntigravityProvider via AgyCliProtocol (HeadlessCliAgentProvider
     }
   });
 
+  it('drops a turn cancelled while queued behind the startup gate without writing config or spawning, and lets later turns through', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'agy-gate-abort-'));
+    try {
+      const timeline: string[] = [];
+      let startFirst!: () => void;
+      const firstMayStart = new Promise<void>((resolve) => {
+        startFirst = resolve;
+      });
+      const makeProtocol = (label: string, gateOnStart?: Promise<void>) =>
+        new AgyCliProtocol({
+          syncMcpServers: async () => {
+            timeline.push(`${label}:write`);
+          },
+          runNdjson: async function* () {
+            if (gateOnStart) await gateOnStart;
+            timeline.push(`${label}:spawn`);
+            yield {
+              kind: 'record',
+              value: {
+                event: 'result',
+                result: { conversation_id: `conv-${label}`, status: 'SUCCESS', response: 'OK' },
+              },
+            };
+          },
+        });
+      const drain = async (events: AsyncIterable<unknown>) => {
+        for await (const _ of events) {
+          // consume
+        }
+      };
+
+      const first = makeProtocol('a', firstMayStart);
+      const queued = makeProtocol('b');
+      const alreadyCancelled = makeProtocol('c');
+      const later = makeProtocol('d');
+      const sessionFor = (p: AgyCliProtocol) => p.createSession({ workspacePath: dir });
+
+      const firstTurn = drain(first.sendMessage(await sessionFor(first), { content: 'one' }));
+      await vi.waitFor(() => expect(timeline).toContain('a:write'));
+
+      // Queued behind the first turn, then cancelled while waiting.
+      const queuedAbort = new AbortController();
+      const queuedTurn = drain(
+        queued.sendMessage(await sessionFor(queued), {
+          content: 'two',
+          abortSignal: queuedAbort.signal,
+        }),
+      );
+      // Already cancelled when it asks for the gate.
+      const preAborted = new AbortController();
+      preAborted.abort();
+      const cancelledTurn = drain(
+        alreadyCancelled.sendMessage(await sessionFor(alreadyCancelled), {
+          content: 'three',
+          abortSignal: preAborted.signal,
+        }),
+      );
+      await expect(cancelledTurn).rejects.toMatchObject({ name: 'AbortError' });
+
+      queuedAbort.abort();
+      await expect(queuedTurn).rejects.toMatchObject({ name: 'AbortError' });
+      // Neither cancelled turn touched the config file or started a process.
+      expect(timeline).toEqual(['a:write']);
+
+      // A turn queued after the cancelled ones still runs once the first finishes:
+      // the cancelled turns released their gate slots.
+      const laterTurn = drain(later.sendMessage(await sessionFor(later), { content: 'four' }));
+      startFirst();
+      await Promise.all([firstTurn, laterTurn]);
+      expect(timeline).toEqual(['a:write', 'a:spawn', 'd:write', 'd:spawn']);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it('bounds inlined attachments on Windows, preserves long prompts on POSIX, and fails explicitly with E2BIG instead of truncating', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'agy-cmdline-'));
     try {
