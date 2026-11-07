@@ -1107,6 +1107,42 @@ describe('GeminiAntigravityProvider via AgyCliProtocol (HeadlessCliAgentProvider
     );
   });
 
+  it('reports a stopped turn as cancelled when the transport ends normally on abort, as the real one does', async () => {
+    // runHeadlessNdjson kills the process and returns, without throwing,
+    // when the abort signal fires (HeadlessNdjsonProcess.ts).
+    const dir = mkdtempSync(join(tmpdir(), 'agy-timing-cancel-return-'));
+    try {
+      let t = 0;
+      const timings: Array<{ outcome: string; totalMs: number }> = [];
+      const stop = new AbortController();
+      const protocol = new AgyCliProtocol({
+        now: () => t,
+        onTurnTiming: (timing) => timings.push(timing),
+        syncMcpServers: async () => {},
+        runNdjson: async function* () {
+          t = 300;
+          yield {
+            kind: 'record',
+            value: { event: 'init', conversation_id: 'conv-r', init: { model: 'gemini-3.8-flash-low', cwd: dir } },
+          };
+          t = 900;
+          stop.abort();
+        },
+      });
+
+      const session = await protocol.createSession({ workspacePath: dir });
+      for await (const _ of protocol.sendMessage(session, { content: 'hi', abortSignal: stop.signal })) {
+        // consume
+      }
+
+      expect(timings.map(({ outcome, totalMs }) => ({ outcome, totalMs }))).toEqual([
+        { outcome: 'cancelled', totalMs: 900 },
+      ]);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it('sends the system instructions on the first turn of a conversation and not again when it is resumed', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'agy-sysprompt-'));
     try {

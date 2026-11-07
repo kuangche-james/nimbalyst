@@ -526,9 +526,16 @@ export class AgyCliProtocol implements AgentProtocol {
         }
       }
       timing.totalMs = sinceStart();
+      // The transport ends normally, without throwing, when the abort signal
+      // stops the process, so a stopped turn also arrives here.
+      if (message.abortSignal?.aborted) {
+        timing.outcome = 'cancelled';
+        this.onTurnTiming(timing);
+        return;
+      }
       this.onTurnTiming(timing);
-      // Recorded only once the turn has run to completion: if it failed, agy
-      // may never have received the instructions, so the next turn resends.
+      // Recorded only once the turn has run to completion: if it failed or was
+      // stopped, agy may not have kept the instructions, so the next turn resends.
       if (session.id) {
         this.deliveredSystemPrompts.set(session.id, raw.systemPrompt ?? '');
       }
