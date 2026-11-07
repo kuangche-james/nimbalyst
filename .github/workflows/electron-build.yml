@@ -27,6 +27,14 @@ on:
         options:
           - 'true'
           - 'false'
+      platforms:
+        description: 'Platforms to build. Releases (tags, or Create a release = true) always build all.'
+        required: false
+        default: 'windows-x64'
+        type: choice
+        options:
+          - 'windows-x64'
+          - 'all'
   workflow_call:
     inputs:
       release:
@@ -39,6 +47,11 @@ on:
         required: false
         default: false
         type: boolean
+      platforms:
+        description: 'Platforms to build: windows-x64 or all. Releases always build all.'
+        required: false
+        default: 'all'
+        type: string
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
@@ -55,39 +68,46 @@ permissions:
   contents: read
 
 jobs:
+  # Picks the build matrix. A manual non-release run can build Windows x64
+  # alone; a tag push or any run with release=true builds every platform,
+  # because the `sign-windows-arm64` and `release` jobs expect all artifacts.
+  #
+  # Platform notes (moved here from the static matrix):
+  # - macOS x64 is cross-compiled on the arm64 runner by electron-builder.
+  # - windows-11-arm runners are in public preview on GitHub Actions. A native
+  #   ARM64 runner avoids cross-compile toolchain wrangling for node-pty and
+  #   lets bun/electron-builder pick up ARM64 prebuilds.
+  # - DigiCert KeyLocker (smctl) has no `smtools-win32-arm64` bundle, so the
+  #   cloud-HSM re-sign cannot run on that runner. The ARM64 installer is
+  #   cross-signed by the `sign-windows-arm64` job below, on windows-latest (x64).
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.pick.outputs.matrix }}
+    steps:
+      - name: Choose platforms
+        id: pick
+        env:
+          IS_RELEASE: ${{ github.ref_type == 'tag' || inputs.release == true || inputs.release == 'true' }}
+          PLATFORMS: ${{ inputs.platforms || 'all' }}
+        run: |
+          if [ "$IS_RELEASE" != "true" ] && [ "$PLATFORMS" = "windows-x64" ]; then
+            matrix='{"include":[{"os":"windows-latest","platform":"win","arch":"x64"}]}'
+          else
+            matrix='{"include":[{"os":"macos-latest","platform":"mac","arch":"arm64"},{"os":"macos-latest","platform":"mac","arch":"x64"},{"os":"ubuntu-latest","platform":"linux","arch":"x64"},{"os":"windows-latest","platform":"win","arch":"x64"},{"os":"windows-11-arm","platform":"win","arch":"arm64"}]}'
+          fi
+          echo "Building: $matrix"
+          echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
+
   build:
+    needs: plan
     strategy:
       # One platform failing must not cancel the others. With fail-fast on, a
       # single red job skipped the `release` job entirely -- leaving the pushed
       # tag in GitHub's releases.atom feed with no assets behind it, which 404s
       # every client's update check until the tag is deleted by hand (v0.72.0).
       fail-fast: false
-      matrix:
-        include:
-          - os: macos-latest
-            platform: mac
-            arch: arm64
-          # electron-builder can cross-compile x64 on arm64
-          - os: macos-latest
-            platform: mac
-            arch: x64
-          - os: ubuntu-latest
-            platform: linux
-            arch: x64
-          - os: windows-latest
-            platform: win
-            arch: x64
-          # windows-11-arm runners are in public preview on GitHub Actions.
-          # Using a native ARM64 runner avoids cross-compile toolchain wrangling
-          # for node-pty and lets bun/electron-builder pick up ARM64 prebuilds.
-          #
-          # Note: DigiCert KeyLocker (smctl) has no `smtools-win32-arm64`
-          # bundle, so the cloud-HSM re-sign cannot run on this runner. The
-          # ARM64 installer is cross-signed by the `sign-windows-arm64` job
-          # below, which runs on windows-latest (x64).
-          - os: windows-11-arm
-            platform: win
-            arch: arm64
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
 
     runs-on: ${{ matrix.os }}
 
