@@ -151,6 +151,17 @@ export function GeminiPanel({ config, onToggle }: GeminiPanelProps) {
           </div>
 
           <div className="provider-panel-section py-4 mb-4 border-b border-[var(--nim-border)]">
+            <h4 className="provider-panel-section-title text-base font-semibold mb-3 text-[var(--nim-text)]">Permissions</h4>
+            <p className="text-[13px] text-[var(--nim-text-muted)] leading-relaxed">
+              The CLI runs headless and cannot pause to ask, so Gemini only runs in projects
+              set to &quot;Allow edits only&quot; or &quot;Allow everything&quot; (Project Settings &gt;
+              Agent Permissions). In either mode Gemini runs shell commands as well as file
+              edits without asking; the &quot;Allow edits only&quot; limits apply to other agents,
+              not to Gemini. A project set to &quot;Ask every time&quot; refuses the turn up front.
+            </p>
+          </div>
+
+          <div className="provider-panel-section py-4 mb-4 border-b border-[var(--nim-border)]">
             <h4 className="provider-panel-section-title text-base font-semibold mb-3 text-[var(--nim-text)]">File tracking</h4>
             <p className="text-[13px] text-[var(--nim-text-muted)] leading-relaxed">
               The Antigravity CLI performs this agent&apos;s writes. Nimbalyst reads each file

@@ -135,8 +135,8 @@ const DESCRIPTOR: HeadlessCliAgentDescriptor = {
     'Gemini runs through the Antigravity CLI in headless mode, which carries out file edits '
     + 'and shell commands without asking first, so there is no per-tool approval for '
     + 'Nimbalyst to intercept. To use Gemini in this project, set its permission mode to '
-    + '"Allow edits only", "Agent-verified", or "Allow everything" (click the shield icon in '
-    + 'the session header, or open Project Settings > Permissions), then send the message again.',
+    + '"Allow edits only" or "Allow everything" in Project Settings > Agent Permissions, then '
+    + 'send the message again. Either mode lets the CLI run shell commands as well as edits.',
 };
 
 export class GeminiAntigravityProvider extends HeadlessCliAgentProvider {

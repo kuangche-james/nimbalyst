@@ -221,11 +221,17 @@ export class AgyCliProtocol implements AgentProtocol {
       (session.id ? this.sessions.get(session.id) : undefined) ?? { workspacePath: process.cwd() };
     const bareModel = stripProviderPrefix(raw.model);
 
+    // `--print` takes an optional prompt value, so it must come last with the
+    // prompt attached (`--print=<prompt>`). Written as a bare `--print` ahead
+    // of the other flags, agy consumed `--output-format` as the prompt and
+    // ignored the real one after `--`, exiting with code 2 on a real Windows
+    // install (#1653). The attached form also keeps a prompt that starts with
+    // `-` from being read as a flag.
     const args: string[] = [];
     if (session.id) {
       args.push('--conversation', session.id);
     }
-    args.push('--print', '--output-format', 'stream-json');
+    args.push('--output-format', 'stream-json');
     if (bareModel) {
       args.push('--model', bareModel);
     }
@@ -237,10 +243,10 @@ export class AgyCliProtocol implements AgentProtocol {
 
     const commandLineOverhead =
       this.executablePath.length +
-      args.reduce((sum, arg) => sum + arg.length + 3, 6);
+      args.reduce((sum, arg) => sum + arg.length + 3, 6) +
+      '--print='.length;
     args.push(
-      '--',
-      formatAgyPromptWithAttachments(message, raw.systemPrompt, commandLineOverhead),
+      `--print=${formatAgyPromptWithAttachments(message, raw.systemPrompt, commandLineOverhead)}`,
     );
 
     const pendingEdits = new Map<

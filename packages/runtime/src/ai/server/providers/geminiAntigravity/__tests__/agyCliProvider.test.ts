@@ -292,16 +292,21 @@ describe('GeminiAntigravityProvider via AgyCliProtocol (HeadlessCliAgentProvider
         provider.sendMessage('update hello.txt', undefined, 'nim-session-1', undefined, dir),
       );
 
+      // `--print` takes an optional value, so it goes last with the prompt
+      // attached; a bare `--print` ahead of `--output-format` made agy read
+      // "--output-format" as the prompt and exit 2 on a real install.
       expect(capturedArgs.slice(0, -1)).toEqual([
-        '--print',
         '--output-format',
         'stream-json',
         '--model',
         'gemini-4-argon-medium',
         '--dangerously-skip-permissions',
-        '--',
       ]);
-      const sentPrompt = capturedArgs[capturedArgs.length - 1];
+      expect(capturedArgs).not.toContain('--print');
+      expect(capturedArgs).not.toContain('--');
+      const lastArg = capturedArgs[capturedArgs.length - 1];
+      expect(lastArg.startsWith('--print=')).toBe(true);
+      const sentPrompt = lastArg.slice('--print='.length);
       expect(sentPrompt).toContain('<system_instructions>');
       expect(sentPrompt.endsWith('\n\nupdate hello.txt')).toBe(true);
 
