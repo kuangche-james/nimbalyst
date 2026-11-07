@@ -12,6 +12,12 @@ export {
   OPEN_CODEX_AUTH_SETTINGS_EVENT,
 } from './CodexAuthRequiredWidget';
 export type { OpenCodexAuthSettingsEventDetail } from './CodexAuthRequiredWidget';
+export {
+  PermissionModeRequiredWidget,
+  CHANGE_PERMISSION_MODE_EVENT,
+  isPermissionModeRequiredError,
+} from './PermissionModeRequiredWidget';
+export type { ChangePermissionModeEventDetail } from './PermissionModeRequiredWidget';
 export { ContextLimitWidget } from './ContextLimitWidget';
 export { RateLimitWidget } from './RateLimitWidget';
 export { PromptsMenuButton, FloatingTranscriptActions } from './FloatingTranscriptActions';

@@ -214,6 +214,70 @@ describe('MessageSegment', () => {
     expect(events).toEqual([{ anchor: 'codex-auth-section' }]);
   });
 
+  it('offers to change the permission mode when a headless CLI provider refuses the turn over it', () => {
+    // The Gemini (agy) refusal text; Cursor Agent's shares the matched clause.
+    const refusal =
+      'Gemini runs through the Antigravity CLI in headless mode, which carries out file edits '
+      + 'and shell commands without asking first, so there is no per-tool approval for '
+      + 'Nimbalyst to intercept. To use Gemini in this project, set its permission mode to '
+      + '"Allow edits only", "Agent-verified", or "Allow everything".';
+    const message = makeMessage({
+      type: 'system_message',
+      text: refusal,
+      isError: true,
+    });
+    const { container } = render(
+      <MessageSegment
+        message={message}
+        isUser={false}
+        showToolCalls={false}
+        showThinking={false}
+        expandedTools={new Set()}
+        onToggleToolExpand={() => {}}
+        workspacePath="/work/skills"
+      />
+    );
+    const widget = container.querySelector('[data-testid="permission-mode-required-widget"]');
+    expect(widget).not.toBeNull();
+    // The provider's own reason stays visible; the generic red row does not.
+    expect(widget?.textContent ?? '').toMatch(/Allow edits only/);
+    expect(container.querySelector('.text-nim-error')).toBeNull();
+
+    const button = container.querySelector('[data-testid="permission-mode-required-change"]') as HTMLButtonElement | null;
+    expect(button).not.toBeNull();
+    const events: Array<{ workspacePath?: string }> = [];
+    const listener = (e: Event) => {
+      events.push((e as CustomEvent<{ workspacePath?: string }>).detail);
+    };
+    window.addEventListener('nimbalyst:change-permission-mode', listener);
+    try {
+      fireEvent.click(button!);
+    } finally {
+      window.removeEventListener('nimbalyst:change-permission-mode', listener);
+    }
+    expect(events).toEqual([{ workspacePath: '/work/skills' }]);
+  });
+
+  it('leaves unrelated errors on the generic error row', () => {
+    const message = makeMessage({
+      type: 'system_message',
+      text: 'Antigravity CLI (agy) is not installed or not in PATH.',
+      isError: true,
+    });
+    const { container } = render(
+      <MessageSegment
+        message={message}
+        isUser={false}
+        showToolCalls={false}
+        showThinking={false}
+        expandedTools={new Set()}
+        onToggleToolExpand={() => {}}
+      />
+    );
+    expect(container.querySelector('[data-testid="permission-mode-required-widget"]')).toBeNull();
+    expect(container.querySelector('.text-nim-error')).not.toBeNull();
+  });
+
   it('suppresses the Codex auth CTA when shouldShowLoginWidget is false', () => {
     const message = makeMessage({
       type: 'system_message',
