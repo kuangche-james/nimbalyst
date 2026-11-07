@@ -156,9 +156,10 @@ export const PROVIDER_EDIT_TOOL_NAMES: Readonly<Record<AIProviderType, readonly 
 
     // Empty on purpose despite `write_file` being a real edit tool. This table
     // drives a disk-read snapshot taken when the tool call is *announced*;
-    // Gemini instead emits `pre_edit_snapshot` with `authoritative: true` from
-    // inside its write path, which is strictly better and would collide with a
-    // tag written from here for the same toolUseId.
+    // AgyCliProtocol instead reads each file around agy's ACTIVE and DONE
+    // records and emits `pre_edit_snapshot` (non-authoritative, so the host's
+    // FileSnapshotCache is consulted first), which would collide with a tag
+    // written from here for the same toolUseId.
     'antigravity-gemini-agent': Object.freeze([]),
   });
 

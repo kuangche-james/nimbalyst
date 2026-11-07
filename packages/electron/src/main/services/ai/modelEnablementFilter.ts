@@ -69,6 +69,25 @@ export function resolveProviderEnabled(
 }
 
 /**
+ * Providers that fetched models but had every one of them filtered out of the
+ * picker. That is the state worth logging: Settings shows the provider
+ * enabled, the picker shows nothing, and no error is raised anywhere (#1653).
+ * Every other `ai:getModels` call is routine and stays out of `main.log`.
+ */
+export function findProvidersWithAllModelsHidden(
+  fetched: readonly FilterableModel[],
+  shown: readonly FilterableModel[],
+): Array<{ provider: string; fetched: number }> {
+  const shownProviders = new Set(shown.map((model) => model.provider));
+  const counts = new Map<string, number>();
+  for (const model of fetched) {
+    if (shownProviders.has(model.provider)) continue;
+    counts.set(model.provider, (counts.get(model.provider) ?? 0) + 1);
+  }
+  return [...counts].map(([provider, count]) => ({ provider, fetched: count }));
+}
+
+/**
  * Drop allow-lists that no longer name anything the provider offers.
  *
  * An allow-list is a snapshot of ids from the catalog the user saw when they

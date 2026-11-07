@@ -192,17 +192,21 @@ export function normalizeAgyToolArguments(
 ): Record<string, unknown> {
   const args: Record<string, unknown> = { ...rawParams };
   const filePath =
+    str(rawParams.file_path) ??
     str(rawParams.Path) ??
     str(rawParams.TargetFile) ??
-    str(rawParams.file_path) ??
     str(rawParams.filePath) ??
     str(rawParams.path);
   if (filePath) {
-    if (typeof args.file_path !== 'string') args.file_path = filePath;
-    if (typeof args.path !== 'string') args.path = filePath;
+    // One canonical key. Every reader (`extractFilePath`, `EditToolResultCard`,
+    // `GeminiAntigravityRawParser`) checks `file_path` first, and keeping the
+    // aliases made tool cards show the same path three times (#3).
+    for (const alias of ['Path', 'TargetFile', 'filePath', 'path']) delete args[alias];
+    args.file_path = filePath;
   }
-  const command = str(rawParams.CommandLine) ?? str(rawParams.command);
-  if (command && typeof args.command !== 'string') {
+  const command = str(rawParams.command) ?? str(rawParams.CommandLine);
+  if (command) {
+    delete args.CommandLine;
     args.command = command;
   }
   return args;

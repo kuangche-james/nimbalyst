@@ -141,6 +141,8 @@ export class AgyCliProtocol implements AgentProtocol {
   private executablePath = process.platform === 'win32' ? 'agy.exe' : 'agy';
   private processEnv: Record<string, string> | undefined;
   private readonly sessions = new Map<string, SessionOptions>();
+  /** System prompt last delivered to each agy conversation, by conversation id. */
+  private readonly deliveredSystemPrompts = new Map<string, string>();
   private readonly runNdjsonImpl: NonNullable<AgyCliProtocolDeps['runNdjson']>;
   private readonly mcpConfigPath?: string;
   private readonly syncMcpServersImpl: (servers: Record<string, AgyMcpServerEntry>) => Promise<void>;
@@ -245,8 +247,18 @@ export class AgyCliProtocol implements AgentProtocol {
       this.executablePath.length +
       args.reduce((sum, arg) => sum + arg.length + 3, 6) +
       '--print='.length;
+    // A resumed conversation (`--conversation <id>`) already holds the system
+    // instructions it was last given; sending them again adds the whole
+    // system prompt to agy's context on every turn (#3). Send them on a new
+    // conversation, and again only when they changed since last delivered. A
+    // conversation this process has not seen (after an app restart) gets them
+    // once, which is the safe side.
+    const systemPromptForTurn =
+      session.id && this.deliveredSystemPrompts.get(session.id) === (raw.systemPrompt ?? '')
+        ? undefined
+        : raw.systemPrompt;
     args.push(
-      `--print=${formatAgyPromptWithAttachments(message, raw.systemPrompt, commandLineOverhead)}`,
+      `--print=${formatAgyPromptWithAttachments(message, systemPromptForTurn, commandLineOverhead)}`,
     );
 
     const pendingEdits = new Map<
@@ -459,6 +471,11 @@ export class AgyCliProtocol implements AgentProtocol {
         for (const ev of mapAgyRecord(record, editChanges)) {
           yield ev;
         }
+      }
+      // Recorded only once the turn has run to completion: if it failed, agy
+      // may never have received the instructions, so the next turn resends.
+      if (session.id) {
+        this.deliveredSystemPrompts.set(session.id, raw.systemPrompt ?? '');
       }
     } finally {
       releaseStartupGate();

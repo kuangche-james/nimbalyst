@@ -87,6 +87,28 @@ function clampCommandOutput(text: string): string {
     : `${text.slice(0, RUN_COMMAND_MAX_OUTPUT)}\n\n[output truncated at ${RUN_COMMAND_MAX_OUTPUT} characters]`;
 }
 
+/**
+ * How long a successful `agy models` answer is reused. The list changes only
+ * when the account's entitlements change, so a model newly granted to the
+ * account appears in the picker within this window.
+ */
+const AGY_MODEL_CACHE_MS = 10 * 60 * 1000;
+
+/** Runs `agy models` with the given executable and environment; resolves to stdout. */
+export type AgyModelListRunner = (command: string, env: Record<string, string>) => Promise<string>;
+
+async function runAgyModels(command: string, env: Record<string, string>): Promise<string> {
+  const { execFile } = await import('child_process');
+  return new Promise<string>((resolve, reject) => {
+    execFile(
+      command,
+      ['models'],
+      { encoding: 'utf8', timeout: 10_000, windowsHide: true, env },
+      (error, stdout) => (error ? reject(error) : resolve(stdout)),
+    );
+  });
+}
+
 export function formatPriorMessagesForAgySeed(
   messages: Message[] | undefined,
   currentMessage: string,
@@ -158,6 +180,9 @@ export class GeminiAntigravityProvider extends HeadlessCliAgentProvider {
   private static shellEnvironmentLoader: (() => Record<string, string> | null) | null = null;
   private static enhancedPathLoader: (() => string) | null = null;
   private static agyPathLoader: (() => string | null) | null = null;
+  private static modelListRunner: AgyModelListRunner | null = null;
+  private static agyModelCache: { models: AIModel[]; fetchedAt: number } | null = null;
+  private static agyModelRequest: Promise<AIModel[]> | null = null;
 
   private static toolExecutor: GeminiToolExecutor | null = null;
   private static serverConfigLoader: (() => GeminiServerConfig) | null = null;
@@ -640,6 +665,17 @@ export class GeminiAntigravityProvider extends HeadlessCliAgentProvider {
     GeminiAntigravityProvider.enhancedPathLoader = loader;
   }
 
+  /**
+   * Replace the process call behind `getModels()`. Tests use it to observe
+   * how often the CLI is asked; production leaves it unset.
+   */
+  static setModelListRunner(runner: AgyModelListRunner | null): void {
+    GeminiAntigravityProvider.modelListRunner = runner;
+    // A different runner means a different source; never serve the old answer.
+    GeminiAntigravityProvider.agyModelCache = null;
+    GeminiAntigravityProvider.agyModelRequest = null;
+  }
+
   static setAgyPathLoader(loader: (() => string | null) | null): void {
     GeminiAntigravityProvider.agyPathLoader = loader;
   }
@@ -702,33 +738,41 @@ export class GeminiAntigravityProvider extends HeadlessCliAgentProvider {
    * `discoverGeminiModels` (seed list / running hub) if `agy` is unavailable.
    */
   static async getModels(): Promise<AIModel[]> {
+    // `ModelRegistry.clearCache()` runs on every `ai:getAllModels` call, so the
+    // registry's own cache never spared this spawn; at app start `agy models`
+    // ran six times in about 30 seconds, 3–4 seconds each (#3). Only a
+    // successful CLI answer is kept, so a failure is retried next time.
+    const cached = GeminiAntigravityProvider.agyModelCache;
+    if (cached && Date.now() - cached.fetchedAt < AGY_MODEL_CACHE_MS) return cached.models;
+    if (!GeminiAntigravityProvider.agyModelRequest) {
+      GeminiAntigravityProvider.agyModelRequest = GeminiAntigravityProvider.fetchModels().finally(() => {
+        GeminiAntigravityProvider.agyModelRequest = null;
+      });
+    }
+    return GeminiAntigravityProvider.agyModelRequest;
+  }
+
+  private static async fetchModels(): Promise<AIModel[]> {
     const command =
       GeminiAntigravityProvider.agyPathLoader?.() ??
       GeminiAntigravityProvider.resolveAgyExecutablePath() ??
       DESCRIPTOR.executableName;
     try {
-      const { execFile } = await import('child_process');
-      const output = await new Promise<string>((resolve, reject) => {
-        execFile(
-          command,
-          ['models'],
-          {
-            encoding: 'utf8',
-            timeout: 10_000,
-            windowsHide: true,
-            env: buildHeadlessChildEnvironment(GeminiAntigravityProvider.loaders()),
-          },
-          (error, stdout) => (error ? reject(error) : resolve(stdout)),
-        );
-      });
+      const run = GeminiAntigravityProvider.modelListRunner ?? runAgyModels;
+      const output = await run(
+        command,
+        buildHeadlessChildEnvironment(GeminiAntigravityProvider.loaders()),
+      );
       const parsed = parseAgyModelList(output);
       if (parsed.length > 0) {
         console.log(`[Gemini] agy models at ${command} returned ${parsed.length} Gemini model(s)`);
-        return parsed.map((m) => ({
+        const models = parsed.map((m) => ({
           id: `${GEMINI_ANTIGRAVITY_PROVIDER}:${m.key}`,
           name: m.displayName,
           provider: GEMINI_ANTIGRAVITY_PROVIDER,
         }));
+        GeminiAntigravityProvider.agyModelCache = { models, fetchedAt: Date.now() };
+        return models;
       }
       console.warn(
         `[Gemini] agy models at ${command} listed no gemini-* models; using the seed catalog. Output head: ${JSON.stringify(output.slice(0, 300))}`,

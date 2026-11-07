@@ -136,9 +136,7 @@ describe('mapAgyRecord & normalizeAgyUsage', () => {
       id: '02c1b0b1-bd3f-4fa1-91f2-d063e0bbef44:step-2',
       name: 'read_file',
       arguments: {
-        Path: 'C:\\Work\\nimbalyst-study\\CLAUDE.md',
         file_path: 'C:\\Work\\nimbalyst-study\\CLAUDE.md',
-        path: 'C:\\Work\\nimbalyst-study\\CLAUDE.md',
       },
     });
 
@@ -184,9 +182,32 @@ describe('mapAgyRecord & normalizeAgyUsage', () => {
     });
   });
 
+  it('gives each tool call one canonical path and command key, so the card does not repeat them', () => {
+    const step = (name: string, parameters: Record<string, unknown>) => ({
+      event: 'step_update',
+      step_update: {
+        conversation_id: 'conv-args',
+        step_index: 1,
+        state: 'ACTIVE',
+        step_type: 'tool',
+        tool_name: name,
+        tool_info: { name, parameters },
+      },
+    });
+
+    const read = mapAgyRecord(step('read_file', { Path: '/work/project/src/a.ts' })).find(
+      (e) => e.type === 'tool_call',
+    );
+    expect(read?.toolCall?.arguments).toEqual({ file_path: '/work/project/src/a.ts' });
+
+    const run = mapAgyRecord(step('run_command', { CommandLine: 'git status', Cwd: '/work/project' })).find(
+      (e) => e.type === 'tool_call',
+    );
+    expect(run?.toolCall?.arguments).toEqual({ command: 'git status', Cwd: '/work/project' });
+  });
+
   it('normalizes CommandLine onto command for run_command tool calls', () => {
     expect(normalizeAgyToolArguments({ CommandLine: 'git status' })).toEqual({
-      CommandLine: 'git status',
       command: 'git status',
     });
   });
@@ -337,10 +358,8 @@ describe('GeminiAntigravityProvider via AgyCliProtocol (HeadlessCliAgentProvider
         id: 'conv-uuid-1:step-1',
         name: 'write_file',
         arguments: {
-          Path: targetFile,
           Content: 'after\n',
           file_path: targetFile,
-          path: targetFile,
         },
         result: {
           success: true,
@@ -893,6 +912,54 @@ describe('GeminiAntigravityProvider via AgyCliProtocol (HeadlessCliAgentProvider
     }
   });
 
+  it('sends the system instructions on the first turn of a conversation and not again when it is resumed', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'agy-sysprompt-'));
+    try {
+      const prompts: string[] = [];
+      const protocol = new AgyCliProtocol({
+        syncMcpServers: async () => {},
+        runNdjson: async function* (opts) {
+          prompts.push(opts.args[opts.args.length - 1]);
+          yield {
+            kind: 'record',
+            value: { event: 'init', conversation_id: 'conv-sys-1', init: { model: 'gemini-4-argon-medium', cwd: dir } },
+          };
+          yield {
+            kind: 'record',
+            value: { event: 'result', result: { conversation_id: 'conv-sys-1', status: 'SUCCESS', response: 'ok' } },
+          };
+        },
+      });
+      const drain = async (events: AsyncIterable<unknown>) => {
+        for await (const _ of events) {
+          // consume
+        }
+      };
+
+      const first = await protocol.createSession({ workspacePath: dir, systemPrompt: 'Be terse.' });
+      await drain(protocol.sendMessage(first, { content: 'one' }));
+      expect(prompts[0]).toBe('--print=<system_instructions>\nBe terse.\n</system_instructions>\n\none');
+
+      // The provider resumes by agy conversation id on every later turn and
+      // passes the same system prompt again; agy already holds it.
+      const resumed = await protocol.resumeSession('conv-sys-1', { workspacePath: dir, systemPrompt: 'Be terse.' });
+      await drain(protocol.sendMessage(resumed, { content: 'two' }));
+      expect(prompts[1]).toBe('--print=two');
+
+      // Instructions that changed since they were last delivered (a new
+      // session directive, for example) are sent again, once.
+      const changed = await protocol.resumeSession('conv-sys-1', { workspacePath: dir, systemPrompt: 'Be verbose.' });
+      await drain(protocol.sendMessage(changed, { content: 'three' }));
+      expect(prompts[2]).toBe('--print=<system_instructions>\nBe verbose.\n</system_instructions>\n\nthree');
+
+      const after = await protocol.resumeSession('conv-sys-1', { workspacePath: dir, systemPrompt: 'Be verbose.' });
+      await drain(protocol.sendMessage(after, { content: 'four' }));
+      expect(prompts[3]).toBe('--print=four');
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it('drops a turn cancelled while queued behind the startup gate without writing config or spawning, and lets later turns through', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'agy-gate-abort-'));
     try {
@@ -1032,6 +1099,59 @@ describe('GeminiAntigravityProvider via AgyCliProtocol (HeadlessCliAgentProvider
   });
 });
 
+describe('GeminiAntigravityProvider.getModels', () => {
+  const AGY_MODELS_OUTPUT =
+    'gemini-4-argon-medium\tGemini 4 Argon (Medium)\n' +
+    'gemini-3.8-flash-low\tGemini 3.8 Flash (Low)\n' +
+    'claude-opus-5-5-low\tClaude Opus 5.5 (Low)\n';
+
+  afterEach(() => {
+    GeminiAntigravityProvider.setModelListRunner(null);
+    vi.useRealTimers();
+  });
+
+  it('runs `agy models` once for repeated and concurrent requests within the cache window', async () => {
+    let runs = 0;
+    GeminiAntigravityProvider.setModelListRunner(async () => {
+      runs++;
+      return AGY_MODELS_OUTPUT;
+    });
+
+    const [a, b] = await Promise.all([
+      GeminiAntigravityProvider.getModels(),
+      GeminiAntigravityProvider.getModels(),
+    ]);
+    const c = await GeminiAntigravityProvider.getModels();
+
+    expect(runs).toBe(1);
+    expect(a.map((m) => m.id)).toEqual([
+      'antigravity-gemini-agent:gemini-4-argon-medium',
+      'antigravity-gemini-agent:gemini-3.8-flash-low',
+    ]);
+    expect(b).toEqual(a);
+    expect(c).toEqual(a);
+  });
+
+  it('asks the CLI again once the cache window has passed', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    vi.setSystemTime(new Date('2026-01-01T00:00:00Z'));
+    let runs = 0;
+    GeminiAntigravityProvider.setModelListRunner(async () => {
+      runs++;
+      return AGY_MODELS_OUTPUT;
+    });
+
+    await GeminiAntigravityProvider.getModels();
+    vi.setSystemTime(new Date('2026-01-01T00:09:00Z'));
+    await GeminiAntigravityProvider.getModels();
+    expect(runs).toBe(1);
+
+    vi.setSystemTime(new Date('2026-01-01T00:11:00Z'));
+    await GeminiAntigravityProvider.getModels();
+    expect(runs).toBe(2);
+  });
+});
+
 describe('GeminiAntigravityProvider.isInstalled', () => {
   it('ignores the IDE language server: only the agy CLI can serve a production turn', () => {
     vi.spyOn(GeminiAntigravityProvider, 'resolveAgyExecutablePath').mockReturnValue(undefined);
@@ -1150,10 +1270,8 @@ describe('GeminiAntigravityRawParser agy NDJSON and item.completed support', () 
         toolName: 'write_file',
         toolDisplayName: 'write_file',
         arguments: {
-          Path: '/ws/src/index.ts',
           Content: 'hello',
           file_path: '/ws/src/index.ts',
-          path: '/ws/src/index.ts',
         },
         targetFilePath: '/ws/src/index.ts',
         providerToolCallId: 'c1:step-2',
