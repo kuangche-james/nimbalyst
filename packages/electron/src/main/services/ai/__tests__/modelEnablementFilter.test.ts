@@ -1,6 +1,12 @@
 import { describe, it, expect } from 'vitest';
 import { CLAUDE_CODE_VARIANTS, ModelIdentifier } from '@nimbalyst/runtime/ai/server/types';
-import { dropStaleAllowLists, isModelEnabled, resolveProviderEnabled, type ProviderEnablement } from '../modelEnablementFilter';
+import {
+  dropStaleAllowLists,
+  findProvidersWithAllModelsHidden,
+  isModelEnabled,
+  resolveProviderEnabled,
+  type ProviderEnablement,
+} from '../modelEnablementFilter';
 
 /**
  * The gate that once hid Fable 5 from the picker (NIM-1486). These lock in the
@@ -140,6 +146,23 @@ describe('dropStaleAllowLists', () => {
     const { entries: next, stale } = dropStaleAllowLists(entries, catalog);
     expect(stale).toEqual([]);
     expect(next).toEqual(entries);
+  });
+});
+
+describe('findProvidersWithAllModelsHidden', () => {
+  it('names a provider whose fetched models were all filtered out of the picker', () => {
+    // The #1653 report: Gemini fetched six models, a stale allow-list hid them
+    // all, and nothing in main.log said so.
+    const fetched = [
+      { id: 'claude-code:opus', provider: 'claude-code' },
+      { id: 'antigravity-gemini-agent:gemini-4-argon-medium', provider: 'antigravity-gemini-agent' },
+      { id: 'antigravity-gemini-agent:gemini-3.8-flash-low', provider: 'antigravity-gemini-agent' },
+    ];
+    const shown = [{ id: 'claude-code:opus', provider: 'claude-code' }];
+
+    expect(findProvidersWithAllModelsHidden(fetched, shown)).toEqual([
+      { provider: 'antigravity-gemini-agent', fetched: 2 },
+    ]);
   });
 });
 

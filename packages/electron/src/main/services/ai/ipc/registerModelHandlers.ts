@@ -5,8 +5,12 @@ import { getWindowIdForWindow, resolveActiveWorkspacePathForWindowId } from '../
 import { getAgentWorkflowService } from '../../AgentWorkflowService';
 import { safeSend } from '.././aiServiceUtils';
 import { claudeCliSessionSupportsPlugins } from '.././claudeCliLauncherSingleton';
-import { getCachedHeadlessAgentAvailability } from '.././headlessAgentAvailability';
-import { dropStaleAllowLists, isModelEnabled, resolveProviderEnabled } from '.././modelEnablementFilter';
+import {
+  dropStaleAllowLists,
+  findProvidersWithAllModelsHidden,
+  isModelEnabled,
+  resolveProviderEnabled,
+} from '.././modelEnablementFilter';
 import { logger } from '../../../utils/logger';
 import { type AIServiceContext } from './AIServiceContext';
 import { ModelRegistry, ProviderFactory } from '@nimbalyst/runtime/ai/server';
@@ -313,18 +317,14 @@ export function registerModelHandlers(ctx: AIServiceContext): void {
       }
     }
 
-    // One line per call, so a provider that silently vanishes from the picker
-    // (fetched but gated, or never fetched) can be diagnosed from main.log
-    // without a debug build. Gemini's enablement is decided by a detection
-    // probe rather than a stored flag, so its inputs are spelled out (#1653).
-    {
-      const fetched: Record<string, number> = {};
-      for (const model of allModels) fetched[model.provider] = (fetched[model.provider] ?? 0) + 1;
-      const shown: Record<string, number> = {};
-      for (const model of enabledModels) shown[model.provider] = (shown[model.provider] ?? 0) + 1;
-      const geminiAvailability = getCachedHeadlessAgentAvailability('antigravity-gemini-agent');
-      logger.ai.info(
-        `[AIService] ai:getModels enabled=${JSON.stringify([...enabledProviderSet])} fetched=${JSON.stringify(fetched)} shown=${JSON.stringify(shown)} gemini={stored:${JSON.stringify(providerSettings['antigravity-gemini-agent']?.enabled)},probeInstalled:${geminiAvailability.installed},probePath:${JSON.stringify(geminiAvailability.executablePath ?? null)},hidden:${JSON.stringify(providerSettings['antigravity-gemini-agent']?.hiddenModels ?? null)},allow:${JSON.stringify(providerSettings['antigravity-gemini-agent']?.models ?? null)}}`,
+    // A provider that fetched models but shows none is the silent failure
+    // behind #1653: Settings says enabled, the picker is empty, no error. Log
+    // that case with the settings that decided it. Routine calls stay quiet:
+    // this handler runs on every picker load (see the note further down).
+    for (const { provider, fetched } of findProvidersWithAllModelsHidden(allModels, enabledModels)) {
+      const settings = providerSettings[provider as AIProviderType];
+      logger.ai.warn(
+        `[AIService] ai:getModels hid all ${fetched} fetched model(s) for ${provider}: enabled=${JSON.stringify(settings?.enabled)} allow=${JSON.stringify(settings?.models ?? null)} hidden=${JSON.stringify(settings?.hiddenModels ?? null)}`,
       );
     }
 

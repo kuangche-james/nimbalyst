@@ -234,7 +234,7 @@ describe('MessageSegment', () => {
         showThinking={false}
         expandedTools={new Set()}
         onToggleToolExpand={() => {}}
-        workspacePath="/work/skills"
+        workspacePath="/work/project"
       />
     );
     const widget = container.querySelector('[data-testid="permission-mode-required-widget"]');
@@ -255,7 +255,7 @@ describe('MessageSegment', () => {
     } finally {
       window.removeEventListener('nimbalyst:change-permission-mode', listener);
     }
-    expect(events).toEqual([{ workspacePath: '/work/skills' }]);
+    expect(events).toEqual([{ workspacePath: '/work/project' }]);
   });
 
   it('leaves unrelated errors on the generic error row', () => {
