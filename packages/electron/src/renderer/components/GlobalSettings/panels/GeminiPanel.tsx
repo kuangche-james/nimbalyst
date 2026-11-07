@@ -153,20 +153,22 @@ export function GeminiPanel({ config, onToggle }: GeminiPanelProps) {
           <div className="provider-panel-section py-4 mb-4 border-b border-[var(--nim-border)]">
             <h4 className="provider-panel-section-title text-base font-semibold mb-3 text-[var(--nim-text)]">File tracking</h4>
             <p className="text-[13px] text-[var(--nim-text-muted)] leading-relaxed">
-              Nimbalyst performs this agent&apos;s writes itself, so every edit records the
-              file&apos;s exact contents from before it changed and diff review is precise.
-              Deletes and renames go through shell commands instead; Nimbalyst watches the
-              project folder to catch those, so one can occasionally be attributed to the
-              wrong turn.
+              The Antigravity CLI performs this agent&apos;s writes. Nimbalyst reads each file
+              as the CLI reports the edit starting and finishing, so diff review has a real
+              before-and-after for edits it sees in time; when the CLI has already written
+              the file, Nimbalyst reconstructs the previous contents where that is
+              unambiguous and otherwise relies on its own file watcher. Deletes and renames
+              go through shell commands; the watcher catches those too, so one can
+              occasionally be attributed to the wrong turn.
             </p>
           </div>
 
           <div className="provider-panel-section py-4 mb-4 border-b border-[var(--nim-border)] last:border-b-0 last:mb-0 last:pb-0">
             <h4 className="provider-panel-section-title text-base font-semibold mb-3 text-[var(--nim-text)]">Context usage</h4>
             <p className="text-[13px] text-[var(--nim-text-muted)] leading-relaxed">
-              Antigravity reports no token counts, so Nimbalyst shows no context meter for
-              Gemini rather than a made-up one. Remaining quota is shown in the usage
-              indicator instead.
+              The Antigravity CLI reports token counts at the end of each turn, so the
+              context meter reflects what Gemini actually used. Remaining quota is shown in
+              the usage indicator.
             </p>
           </div>
         </>
