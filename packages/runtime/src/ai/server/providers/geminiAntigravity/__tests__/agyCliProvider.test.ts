@@ -15,6 +15,7 @@ import {
   AGY_MAX_COMMAND_LINE_CHARS,
   AgyCliProtocol,
   formatAgyPromptWithAttachments,
+  formatAgyTurnTiming,
   mapAgyRecord,
   normalizeAgyToolArguments,
   normalizeAgyUsage,
@@ -907,6 +908,236 @@ describe('GeminiAntigravityProvider via AgyCliProtocol (HeadlessCliAgentProvider
       startFirst();
       await Promise.all([firstTurn, secondTurn]);
       expect(timeline).toEqual(['a:write', 'a:init', 'b:write', 'b:init']);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('reports one timing record per completed turn, with each phase measured from the start of the turn', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'agy-timing-'));
+    try {
+      let t = 1000;
+      const timings: unknown[] = [];
+      const step = (index: number, state: string, extra: Record<string, unknown>) => ({
+        kind: 'record' as const,
+        value: {
+          event: 'step_update',
+          step_update: { conversation_id: 'conv-t', step_index: index, state, ...extra },
+        },
+      });
+      const protocol = new AgyCliProtocol({
+        now: () => t,
+        onTurnTiming: (timing) => timings.push(timing),
+        syncMcpServers: async () => {
+          t = 1040;
+        },
+        runNdjson: async function* () {
+          t = 1300;
+          yield {
+            kind: 'record',
+            value: { event: 'init', conversation_id: 'conv-t', init: { model: 'gemini-3.8-flash-low', cwd: dir } },
+          };
+          t = 1800;
+          yield step(1, 'ACTIVE', { step_type: 'agent_response', text_delta: 'Reading it.' });
+          t = 1900;
+          yield step(2, 'ACTIVE', { step_type: 'tool', tool_name: 'read_file', tool_info: { name: 'read_file', parameters: { Path: 'a.ts' } } });
+          t = 2400;
+          yield step(2, 'DONE', { step_type: 'tool', tool_name: 'read_file', tool_info: { name: 'read_file', parameters: { Path: 'a.ts' }, output: 'x' } });
+          t = 2600;
+          yield {
+            kind: 'record',
+            value: { event: 'result', result: { conversation_id: 'conv-t', status: 'SUCCESS', response: 'Reading it.' } },
+          };
+        },
+      });
+
+      const session = await protocol.createSession({
+        workspacePath: dir,
+        model: 'antigravity-gemini-agent:gemini-3.8-flash-low',
+        systemPrompt: 'Be terse.',
+      });
+      for await (const _ of protocol.sendMessage(session, { content: 'hello' })) {
+        // consume
+      }
+
+      expect(timings).toEqual([
+        {
+          outcome: 'completed',
+          model: 'gemini-3.8-flash-low',
+          resumed: false,
+          // '<system_instructions>\nBe terse.\n</system_instructions>\n\nhello'
+          promptChars: 61,
+          systemInstructionsSent: true,
+          configWrittenMs: 40,
+          firstRecordMs: 300,
+          firstTextMs: 800,
+          resultMs: 1600,
+          totalMs: 1600,
+          tools: [{ name: 'read_file', durationMs: 500 }],
+        },
+      ]);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('still reports a timing record when the turn fails, with only the phases it reached', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'agy-timing-fail-'));
+    try {
+      let t = 5000;
+      const timings: unknown[] = [];
+      const protocol = new AgyCliProtocol({
+        now: () => t,
+        onTurnTiming: (timing) => timings.push(timing),
+        syncMcpServers: async () => {
+          t = 5010;
+        },
+        runNdjson: async function* () {
+          t = 5200;
+          yield {
+            kind: 'record',
+            value: { event: 'init', conversation_id: 'conv-f', init: { model: 'gemini-4-argon-high', cwd: dir } },
+          };
+          t = 9200;
+          throw new Error('Agent process exited with code 1');
+        },
+      });
+
+      const session = await protocol.createSession({ workspacePath: dir, model: 'gemini-4-argon-high' });
+      await expect(async () => {
+        for await (const _ of protocol.sendMessage(session, { content: 'hi' })) {
+          // consume
+        }
+      }).rejects.toThrow('exited with code 1');
+
+      expect(timings).toEqual([
+        {
+          outcome: 'failed',
+          model: 'gemini-4-argon-high',
+          resumed: false,
+          promptChars: 2,
+          systemInstructionsSent: false,
+          configWrittenMs: 10,
+          firstRecordMs: 200,
+          totalMs: 4200,
+          tools: [],
+        },
+      ]);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('reports a turn the user stopped as cancelled, not failed', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'agy-timing-cancel-'));
+    try {
+      let t = 0;
+      const timings: Array<{ outcome: string; totalMs: number }> = [];
+      const stop = new AbortController();
+      const protocol = new AgyCliProtocol({
+        now: () => t,
+        onTurnTiming: (timing) => timings.push(timing),
+        syncMcpServers: async () => {},
+        runNdjson: async function* () {
+          t = 300;
+          yield {
+            kind: 'record',
+            value: { event: 'init', conversation_id: 'conv-c', init: { model: 'gemini-3.8-flash-low', cwd: dir } },
+          };
+          t = 700;
+          stop.abort();
+          throw new Error('Agent process was aborted');
+        },
+      });
+
+      const session = await protocol.createSession({ workspacePath: dir });
+      await expect(async () => {
+        for await (const _ of protocol.sendMessage(session, { content: 'hi', abortSignal: stop.signal })) {
+          // consume
+        }
+      }).rejects.toThrow('aborted');
+
+      expect(timings.map(({ outcome, totalMs }) => ({ outcome, totalMs }))).toEqual([
+        { outcome: 'cancelled', totalMs: 700 },
+      ]);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('formats a turn timing as one readable main.log line listing only the phases reached', () => {
+    expect(
+      formatAgyTurnTiming({
+        outcome: 'completed',
+        model: 'gemini-3.8-flash-low',
+        resumed: false,
+        promptChars: 61,
+        systemInstructionsSent: true,
+        configWrittenMs: 40,
+        firstRecordMs: 300,
+        firstTextMs: 800,
+        resultMs: 1600,
+        totalMs: 1600,
+        tools: [
+          { name: 'read_file', durationMs: 500 },
+          { name: 'run_command', durationMs: 1200 },
+        ],
+      }),
+    ).toBe(
+      '[Gemini] turn completed in 1600ms: model=gemini-3.8-flash-low new-conversation prompt=61ch+instructions'
+        + ' | config 40ms, first record 300ms, first text 800ms, result 1600ms'
+        + ' | tools: read_file 500ms, run_command 1200ms',
+    );
+
+    expect(
+      formatAgyTurnTiming({
+        outcome: 'failed',
+        model: 'gemini-4-argon-high',
+        resumed: true,
+        promptChars: 2,
+        systemInstructionsSent: false,
+        configWrittenMs: 10,
+        firstRecordMs: 200,
+        totalMs: 4200,
+        tools: [],
+      }),
+    ).toBe(
+      '[Gemini] turn failed in 4200ms: model=gemini-4-argon-high resumed prompt=2ch'
+        + ' | config 10ms, first record 200ms | tools: none',
+    );
+  });
+
+  it('reports a stopped turn as cancelled when the transport ends normally on abort, as the real one does', async () => {
+    // runHeadlessNdjson kills the process and returns, without throwing,
+    // when the abort signal fires (HeadlessNdjsonProcess.ts).
+    const dir = mkdtempSync(join(tmpdir(), 'agy-timing-cancel-return-'));
+    try {
+      let t = 0;
+      const timings: Array<{ outcome: string; totalMs: number }> = [];
+      const stop = new AbortController();
+      const protocol = new AgyCliProtocol({
+        now: () => t,
+        onTurnTiming: (timing) => timings.push(timing),
+        syncMcpServers: async () => {},
+        runNdjson: async function* () {
+          t = 300;
+          yield {
+            kind: 'record',
+            value: { event: 'init', conversation_id: 'conv-r', init: { model: 'gemini-3.8-flash-low', cwd: dir } },
+          };
+          t = 900;
+          stop.abort();
+        },
+      });
+
+      const session = await protocol.createSession({ workspacePath: dir });
+      for await (const _ of protocol.sendMessage(session, { content: 'hi', abortSignal: stop.signal })) {
+        // consume
+      }
+
+      expect(timings.map(({ outcome, totalMs }) => ({ outcome, totalMs }))).toEqual([
+        { outcome: 'cancelled', totalMs: 900 },
+      ]);
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }

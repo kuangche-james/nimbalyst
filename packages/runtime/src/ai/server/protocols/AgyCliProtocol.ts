@@ -133,6 +133,29 @@ export interface AgyCliProtocolDeps {
   runNdjson?: (options: HeadlessNdjsonRunOptions) => AsyncGenerator<HeadlessNdjsonItem>;
   mcpConfigPath?: string;
   syncMcpServers?: (servers: Record<string, AgyMcpServerEntry>) => Promise<void>;
+  /** Clock for turn timings, in milliseconds. Defaults to `Date.now`. */
+  now?: () => number;
+  /** Receives one timing record per turn. Defaults to one `main.log` line. */
+  onTurnTiming?: (timing: AgyTurnTiming) => void;
+}
+
+/**
+ * Where one Gemini turn spent its time (#6). Phase times are milliseconds from
+ * the start of the turn; a phase the turn never reached is absent. Carries no
+ * prompt text, file contents, paths or account details.
+ */
+export interface AgyTurnTiming {
+  outcome: 'completed' | 'failed' | 'cancelled';
+  model?: string;
+  resumed: boolean;
+  promptChars: number;
+  systemInstructionsSent: boolean;
+  configWrittenMs?: number;
+  firstRecordMs?: number;
+  firstTextMs?: number;
+  resultMs?: number;
+  totalMs: number;
+  tools: Array<{ name: string; durationMs: number }>;
 }
 
 export class AgyCliProtocol implements AgentProtocol {
@@ -146,9 +169,13 @@ export class AgyCliProtocol implements AgentProtocol {
   private readonly runNdjsonImpl: NonNullable<AgyCliProtocolDeps['runNdjson']>;
   private readonly mcpConfigPath?: string;
   private readonly syncMcpServersImpl: (servers: Record<string, AgyMcpServerEntry>) => Promise<void>;
+  private readonly now: () => number;
+  private readonly onTurnTiming: (timing: AgyTurnTiming) => void;
 
   constructor(deps?: AgyCliProtocolDeps) {
     this.runNdjsonImpl = deps?.runNdjson ?? runHeadlessNdjson;
+    this.now = deps?.now ?? Date.now;
+    this.onTurnTiming = deps?.onTurnTiming ?? ((timing) => console.log(formatAgyTurnTiming(timing)));
     this.mcpConfigPath = deps?.mcpConfigPath;
     this.syncMcpServersImpl =
       deps?.syncMcpServers ??
@@ -222,6 +249,8 @@ export class AgyCliProtocol implements AgentProtocol {
     const raw = (session.raw as AgySessionRaw | undefined) ??
       (session.id ? this.sessions.get(session.id) : undefined) ?? { workspacePath: process.cwd() };
     const bareModel = stripProviderPrefix(raw.model);
+    const turnStartedAt = this.now();
+    const sinceStart = () => this.now() - turnStartedAt;
 
     // `--print` takes an optional prompt value, so it must come last with the
     // prompt attached (`--print=<prompt>`). Written as a bare `--print` ahead
@@ -257,9 +286,18 @@ export class AgyCliProtocol implements AgentProtocol {
       session.id && this.deliveredSystemPrompts.get(session.id) === (raw.systemPrompt ?? '')
         ? undefined
         : raw.systemPrompt;
-    args.push(
-      `--print=${formatAgyPromptWithAttachments(message, systemPromptForTurn, commandLineOverhead)}`,
-    );
+    const prompt = formatAgyPromptWithAttachments(message, systemPromptForTurn, commandLineOverhead);
+    args.push(`--print=${prompt}`);
+    const timing: AgyTurnTiming = {
+      outcome: 'completed',
+      model: bareModel,
+      resumed: Boolean(session.id),
+      promptChars: prompt.length,
+      systemInstructionsSent: Boolean(systemPromptForTurn?.trim()),
+      totalMs: 0,
+      tools: [],
+    };
+    const toolStartedAt = new Map<string, { name: string; at: number }>();
 
     const pendingEdits = new Map<
       string,
@@ -296,6 +334,7 @@ export class AgyCliProtocol implements AgentProtocol {
 
     try {
       await this.syncMcpServersImpl(normalizeAgyMcpServers(raw.mcpServers));
+      timing.configWrittenMs = sinceStart();
       if (message.abortSignal?.aborted) {
         // Cancelled during the config write: do not start the process.
         throw agyAbortError();
@@ -317,9 +356,11 @@ export class AgyCliProtocol implements AgentProtocol {
         // Any output at all means the CLI is up and has loaded its config.
         releaseStartupGate();
         if (item.kind === 'garbage') continue;
+        timing.firstRecordMs ??= sinceStart();
 
         const record = item.value;
         const eventKind = typeof record.event === 'string' ? record.event : record.type;
+        if (eventKind === 'result') timing.resultMs ??= sinceStart();
 
         if (eventKind === 'init') {
           const convId = typeof record.conversation_id === 'string' ? record.conversation_id.trim() : '';
@@ -469,14 +510,41 @@ export class AgyCliProtocol implements AgentProtocol {
         }
 
         for (const ev of mapAgyRecord(record, editChanges)) {
+          if (ev.type === 'text') {
+            timing.firstTextMs ??= sinceStart();
+          } else if (ev.type === 'tool_call' && ev.toolCall?.id) {
+            toolStartedAt.set(ev.toolCall.id, { name: ev.toolCall.name, at: sinceStart() });
+          } else if (ev.type === 'tool_result' && ev.toolResult?.id) {
+            const resultId = ev.toolResult.id;
+            const started = toolStartedAt.get(resultId);
+            if (started) {
+              toolStartedAt.delete(resultId);
+              timing.tools.push({ name: started.name, durationMs: sinceStart() - started.at });
+            }
+          }
           yield ev;
         }
       }
-      // Recorded only once the turn has run to completion: if it failed, agy
-      // may never have received the instructions, so the next turn resends.
+      timing.totalMs = sinceStart();
+      // The transport ends normally, without throwing, when the abort signal
+      // stops the process, so a stopped turn also arrives here.
+      if (message.abortSignal?.aborted) {
+        timing.outcome = 'cancelled';
+        this.onTurnTiming(timing);
+        return;
+      }
+      this.onTurnTiming(timing);
+      // Recorded only once the turn has run to completion: if it failed or was
+      // stopped, agy may not have kept the instructions, so the next turn resends.
       if (session.id) {
         this.deliveredSystemPrompts.set(session.id, raw.systemPrompt ?? '');
       }
+    } catch (error) {
+      // A slow failure is exactly what the timing line has to show.
+      timing.outcome = message.abortSignal?.aborted ? 'cancelled' : 'failed';
+      timing.totalMs = sinceStart();
+      this.onTurnTiming(timing);
+      throw error;
     } finally {
       releaseStartupGate();
       clearTimeout(gateTimer);
@@ -679,6 +747,34 @@ function tryReverseApplyAgyEdit(
   }
 
   return null;
+}
+
+/**
+ * The `main.log` line for one turn's timing: outcome and total first, then the
+ * phases the turn reached, then each tool call. Built only from the timing
+ * record, which holds no prompt text, file contents or paths.
+ */
+export function formatAgyTurnTiming(timing: AgyTurnTiming): string {
+  const head =
+    `[Gemini] turn ${timing.outcome} in ${timing.totalMs}ms:`
+    + ` model=${timing.model ?? 'default'}`
+    + ` ${timing.resumed ? 'resumed' : 'new-conversation'}`
+    + ` prompt=${timing.promptChars}ch${timing.systemInstructionsSent ? '+instructions' : ''}`;
+  const phases = (
+    [
+      ['config', timing.configWrittenMs],
+      ['first record', timing.firstRecordMs],
+      ['first text', timing.firstTextMs],
+      ['result', timing.resultMs],
+    ] as const
+  )
+    .filter(([, ms]) => ms !== undefined)
+    .map(([label, ms]) => `${label} ${ms}ms`)
+    .join(', ');
+  const tools = timing.tools.length > 0
+    ? timing.tools.map((tool) => `${tool.name} ${tool.durationMs}ms`).join(', ')
+    : 'none';
+  return `${head} | ${phases} | tools: ${tools}`;
 }
 
 export function formatAgyPromptWithAttachments(
