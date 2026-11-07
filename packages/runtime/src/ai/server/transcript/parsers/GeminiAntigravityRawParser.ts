@@ -34,21 +34,33 @@ import type {
   ParseContext,
   CanonicalEventDescriptor,
 } from './IRawMessageParser';
+import { mapAgyRecord } from '../../protocols/headless/AgyRecordMapper';
+import type { ProtocolEvent } from '../../protocols/ProtocolInterface';
 
 /** Tool argument keys that name a file, in the Gemini toolset's spelling. */
-const FILE_PATH_KEYS = ['path', 'file_path'] as const;
+const FILE_PATH_KEYS = ['path', 'file_path', 'Path', 'TargetFile'] as const;
 
 export class GeminiAntigravityRawParser implements IRawMessageParser {
   async parseMessage(
     msg: RawMessage,
-    _context: ParseContext,
+    context: ParseContext,
   ): Promise<CanonicalEventDescriptor[]> {
     if (msg.hidden) return [];
-    return msg.direction === 'input' ? this.parseInput(msg) : this.parseOutput(msg);
+    return msg.direction === 'input' ? this.parseInput(msg) : this.parseOutput(msg, context);
   }
 
   private parseInput(msg: RawMessage): CanonicalEventDescriptor[] {
-    const text = String(msg.content ?? '').trim();
+    const raw = String(msg.content ?? '').trim();
+    if (!raw) return [];
+    let text = raw;
+    try {
+      const parsed = JSON.parse(raw) as { text?: unknown };
+      if (parsed && typeof parsed === 'object' && typeof parsed.text === 'string') {
+        text = parsed.text;
+      }
+    } catch {
+      // Plain text input
+    }
     if (!text) return [];
     return [{
       type: 'user_message',
@@ -58,17 +70,96 @@ export class GeminiAntigravityRawParser implements IRawMessageParser {
     }];
   }
 
-  private parseOutput(msg: RawMessage): CanonicalEventDescriptor[] {
+  private async parseOutput(
+    msg: RawMessage,
+    context: ParseContext,
+  ): Promise<CanonicalEventDescriptor[]> {
     if (msg.metadata?.role === 'tool') {
       return this.parseToolRow(msg);
     }
 
-    // Assistant text is stored verbatim, not wrapped. A row whose role says
-    // 'assistant' is trusted as text even if the model's answer happens to be
-    // valid JSON — parsing it would turn an answer that discusses JSON into a
-    // silently dropped message.
-    const text = String(msg.content ?? '').trim();
-    return text ? [{ type: 'assistant_message', text, createdAt: msg.createdAt }] : [];
+    // Legacy assistant text is stored verbatim with metadata.role === 'assistant'.
+    // Trust it as text even if the model's answer happens to be valid JSON.
+    if (msg.metadata?.role === 'assistant') {
+      const text = String(msg.content ?? '').trim();
+      return text ? [{ type: 'assistant_message', text, createdAt: msg.createdAt }] : [];
+    }
+
+    const rawText = String(msg.content ?? '').trim();
+    if (!rawText) return [];
+
+    let record: Record<string, unknown> | undefined;
+    try {
+      const parsed = JSON.parse(rawText);
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+        record = parsed as Record<string, unknown>;
+      }
+    } catch {
+      // Not JSON — fall back to plain text assistant message.
+    }
+
+    if (!record) {
+      return [{ type: 'assistant_message', text: rawText, createdAt: msg.createdAt }];
+    }
+
+    // Turn-final assistant message written by HeadlessCliAgentProvider.storeAssistantResponse.
+    if (record.type === 'item.completed') {
+      const item = record.item as {
+        type?: unknown;
+        role?: unknown;
+        content?: Array<{ type?: unknown; text?: unknown }>;
+      } | undefined;
+      if (item?.type === 'message' && item.role === 'assistant' && Array.isArray(item.content)) {
+        const text = item.content
+          .filter((c) => c?.type === 'output_text' && typeof c.text === 'string')
+          .map((c) => c.text as string)
+          .join('');
+        return text ? [{ type: 'assistant_message', text, createdAt: msg.createdAt }] : [];
+      }
+      return [];
+    }
+
+    if (record.type === 'nimbalyst_tool_use') {
+      const id = typeof record.id === 'string' ? record.id : null;
+      if (id && context.hasToolCall && (context.hasToolCall(id) || await context.findByProviderToolCallId?.(id))) {
+        return [];
+      }
+      const args = record.input;
+      return [{
+        type: 'tool_call_started',
+        toolName: typeof record.name === 'string' ? record.name : 'unknown',
+        toolDisplayName: typeof record.name === 'string' ? record.name : 'unknown',
+        arguments: (args && typeof args === 'object' ? args : {}) as Record<string, unknown>,
+        providerToolCallId: id,
+        createdAt: msg.createdAt,
+      }];
+    }
+    if (record.type === 'nimbalyst_tool_result') {
+      const id = typeof record.tool_use_id === 'string'
+        ? record.tool_use_id
+        : typeof record.id === 'string' ? record.id : null;
+      if (!id) return [];
+      const isError = record.is_error === true;
+      return [{
+        type: 'tool_call_completed',
+        providerToolCallId: id,
+        status: isError ? 'error' : 'completed',
+        isError,
+        result: typeof record.result === 'string' ? record.result : safeStringify(record.result),
+      }];
+    }
+
+    // Antigravity CLI (`agy --print --output-format stream-json`) NDJSON records.
+    if (typeof record.event === 'string') {
+      const out: CanonicalEventDescriptor[] = [];
+      for (const ev of mapAgyRecord(record)) {
+        const projected = projectAgyProtocolEvent(ev, msg.createdAt);
+        if (projected) out.push(projected);
+      }
+      return out;
+    }
+
+    return [{ type: 'assistant_message', text: rawText, createdAt: msg.createdAt }];
   }
 
   private parseToolRow(msg: RawMessage): CanonicalEventDescriptor[] {
@@ -110,6 +201,45 @@ export class GeminiAntigravityRawParser implements IRawMessageParser {
         result: resultText,
       },
     ];
+  }
+}
+
+function projectAgyProtocolEvent(
+  ev: ProtocolEvent,
+  createdAt?: Date,
+): CanonicalEventDescriptor | null {
+  switch (ev.type) {
+    case 'tool_call': {
+      const tc = ev.toolCall;
+      if (!tc) return null;
+      const args = (tc.arguments ?? {}) as Record<string, unknown>;
+      return {
+        type: 'tool_call_started',
+        toolName: tc.name,
+        toolDisplayName: tc.name,
+        arguments: args,
+        targetFilePath: readTargetFilePath(args),
+        providerToolCallId: tc.id ?? null,
+        createdAt,
+      };
+    }
+    case 'tool_result': {
+      const tr = ev.toolResult;
+      if (!tr || !tr.id) return null;
+      const isObj = typeof tr.result === 'object' && tr.result !== null;
+      const isError = isObj && (tr.result as { success?: boolean }).success === false;
+      const resultStr =
+        typeof tr.result === 'string' ? tr.result : safeStringify(tr.result);
+      return {
+        type: 'tool_call_completed',
+        providerToolCallId: tr.id,
+        status: isError ? 'error' : 'completed',
+        isError,
+        result: resultStr,
+      };
+    }
+    default:
+      return null;
   }
 }
 

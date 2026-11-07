@@ -240,7 +240,6 @@ import { matchesAllowPattern } from '@nimbalyst/runtime/ai/server/permissions/to
 import { resolveCodexPreEditHookScriptPath } from './services/ai/codexPreEditHookPath';
 import {configureCodexShellTracking} from './services/ai/codexShellTrackingHost';
 import { createGrokAskUserQuestionHandler } from './services/ai/grokAskUserQuestionHandler';
-import { executeGeminiTool } from './services/ai/geminiToolExecutor';
 import { sessionFileTracker } from './services/SessionFileTracker';
 import {
   refreshHeadlessAgentAvailability,
@@ -2075,6 +2074,9 @@ app.whenReady().then(async () => {
     CursorAgentProvider.setMCPConfigLoader(
         (workspacePath?: string) => syncHeadlessAgentMcpConfig('cursor-agent', MCP_PROVIDER_IDS.CURSOR, 'Cursor', workspacePath),
     );
+    GeminiAntigravityProvider.setMCPConfigLoader(
+        (workspacePath?: string) => loadEnabledMcpServersFor(MCP_PROVIDER_IDS.GEMINI, 'Gemini', workspacePath),
+    );
 
     // Claude CLI (subscription) launcher shares the Claude Agent MCP filter —
     // the genuine CLI hits the identical MCP handlers as the SDK path (NIM-806).
@@ -2161,6 +2163,7 @@ app.whenReady().then(async () => {
     CopilotCLIProvider.setShellEnvironmentLoader(() => getShellEnvironment());
     GrokBuildProvider.setShellEnvironmentLoader(() => getShellEnvironment());
     CursorAgentProvider.setShellEnvironmentLoader(() => getShellEnvironment());
+    GeminiAntigravityProvider.setShellEnvironmentLoader(() => getShellEnvironment());
 
     // Inject enhanced PATH loader so agents can access system tools
     // (docker, homebrew, nvm, etc.) that are missing from Electron's GUI PATH.
@@ -2174,11 +2177,8 @@ app.whenReady().then(async () => {
     CopilotCLIProvider.setEnhancedPathLoader(() => getEnhancedPath());
     GrokBuildProvider.setEnhancedPathLoader(() => getEnhancedPath());
     CursorAgentProvider.setEnhancedPathLoader(() => getEnhancedPath());
+    GeminiAntigravityProvider.setEnhancedPathLoader(() => getEnhancedPath());
 
-    // Gemini executes its tools in this process. The provider ships in the
-    // runtime package, which cannot import from main, so the executor is
-    // injected rather than imported.
-    GeminiAntigravityProvider.setToolExecutor(executeGeminiTool);
     // The Antigravity language server enforces a supported-build floor against
     // --override_ide_version and rejects anything below it. Reading the value
     // from settings means a user hit by a vendor-side bump can raise it without
@@ -2458,6 +2458,7 @@ app.whenReady().then(async () => {
       OpenAICodexACPProvider.setSecurityLogger(securityLogger);
       GrokBuildProvider.setSecurityLogger(securityLogger);
       CursorAgentProvider.setSecurityLogger(securityLogger);
+      GeminiAntigravityProvider.setSecurityLogger(securityLogger);
     }
 
     ClaudeCodeProvider.setClaudeSettingsPatternSaver(patternSaver);
@@ -2492,9 +2493,10 @@ app.whenReady().then(async () => {
     // started this workstream.
     GrokBuildProvider.setAskUserQuestionHandler(createGrokAskUserQuestionHandler());
 
-    // Cursor's one-shot headless transport still gates the whole turn; Grok's
-    // ACP transport uses the same trust check plus per-tool permission events.
+    // Cursor and Gemini one-shot headless transports gate the whole turn up front;
+    // Grok's ACP transport uses the same trust check plus per-tool permission events.
     CursorAgentProvider.setTrustChecker(trustChecker);
+    GeminiAntigravityProvider.setTrustChecker(trustChecker);
 
     // ACP exposes pre/post file-write hooks. Wire them so Codex ACP edits
     // produce the same FilesEditedSidebar entries and pre-edit baselines as

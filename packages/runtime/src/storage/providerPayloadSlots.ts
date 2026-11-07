@@ -255,12 +255,32 @@ function collectNimbalystSlots(chunk: Record<string, unknown>, out: PayloadSlot[
  * card rather than just its payload.
  */
 function collectGeminiSlots(chunk: Record<string, unknown>, out: PayloadSlot[]): void {
-  if ('result' in chunk) {
+  if ('result' in chunk && typeof chunk.result === 'string') {
     out.push(makeSlot('geminiToolRow', 'result', chunk, 'result'));
   }
   const args = chunk.args;
   if (isPlainObject(args) && 'content' in args) {
     out.push(makeSlot('geminiToolRow', 'args.content', args, 'content'));
+  }
+  // Antigravity CLI (`agy`) step_update tool payload slots
+  const stepUpdate = chunk.step_update;
+  if (isPlainObject(stepUpdate)) {
+    const toolInfo = stepUpdate.tool_info;
+    if (isPlainObject(toolInfo)) {
+      if ('output' in toolInfo) {
+        out.push(makeSlot('geminiToolRow', 'step_update.tool_info.output', toolInfo, 'output'));
+      }
+      const params = toolInfo.parameters;
+      if (isPlainObject(params)) {
+        for (const key of ['Content', 'CodeContent', 'Replacement', 'Target', 'content'] as const) {
+          if (key in params) {
+            out.push(
+              makeSlot('geminiToolRow', `step_update.tool_info.parameters.${key}`, params, key),
+            );
+          }
+        }
+      }
+    }
   }
 }
 

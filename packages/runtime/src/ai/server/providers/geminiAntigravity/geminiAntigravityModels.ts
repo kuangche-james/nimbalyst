@@ -44,59 +44,83 @@ const GOOGLE_API_PROVIDER = 'API_PROVIDER_GOOGLE_GEMINI';
  * a code change: when 3.9 Flash lands, discovery offers it and only the
  * retired tiers stay hidden.
  */
-const MIN_FLASH_GENERATION: readonly [major: number, minor: number] = [3, 7];
+const MIN_FAMILY_GENERATIONS: Readonly<Record<string, readonly [major: number, minor: number]>> = {
+  Flash: [3, 7],
+  Pro: [3, 7],
+  Argon: [4, 0],
+};
 
 /**
- * Matches the Flash agent labels and nothing else.
+ * Matches Gemini agent labels (Flash, Argon, Pro) and nothing else.
  *
  * Anchored on both ends deliberately. The catalog also carries "Gemini 3.5
  * Flash Lite" and "Gemini 3.1 Flash Image", which are different products that
  * happen to share the prefix -- an unanchored match would drag them in.
  */
-const FLASH_LABEL = /^Gemini (\d+)(?:\.(\d+))? Flash(?: \((?:High|Medium|Low)\))?$/;
+const MODEL_LABEL = /^Gemini (\d+)(?:\.(\d+))? (Flash|Argon|Pro)(?: \((?:High|Medium|Low)\))?$/;
 
 /**
- * Generation of a Flash agent label as `[major, minor]`, or null when the
- * label is not a Flash agent at all.
+ * Parse a Gemini agent label into `{ family, generation }`, or null when the
+ * label is not a supported Gemini agent tier.
  */
-function flashGeneration(displayName: string): [number, number] | null {
-  const match = FLASH_LABEL.exec(displayName);
+function parseGeminiModelLabel(
+  displayName: string,
+): { family: string; generation: [number, number] } | null {
+  const match = MODEL_LABEL.exec(displayName);
   if (!match) return null;
-  return [Number(match[1]), match[2] === undefined ? 0 : Number(match[2])];
+  return {
+    family: match[3],
+    generation: [Number(match[1]), match[2] === undefined ? 0 : Number(match[2])],
+  };
 }
 
 /**
- * True when `displayName` is a Flash agent at or above `MIN_FLASH_GENERATION`.
+ * Format a bare `tieredModelIds` key (e.g. `gemini-4-argon-medium` or
+ * `gemini-3.8-flash-high`) into its canonical display label when the server
+ * omits `displayName`. Returns `''` for non-tier keys (such as `*-tiered`).
+ */
+export function formatModelDisplayName(key: string): string {
+  const match = /^gemini-(\d+(?:\.\d+)?)-(flash|argon|pro)-(high|medium|low)$/i.exec(key.trim());
+  if (!match) return '';
+  const [, version, familyRaw, tierRaw] = match;
+  const family = familyRaw.charAt(0).toUpperCase() + familyRaw.slice(1).toLowerCase();
+  const tier = tierRaw.charAt(0).toUpperCase() + tierRaw.slice(1).toLowerCase();
+  return `Gemini ${version} ${family} (${tier})`;
+}
+
+/**
+ * True when `displayName` is a supported Gemini agent model at or above its
+ * family's minimum generation floor.
  *
  * Compared component-wise rather than as a decimal so a future "Gemini 3.10
  * Flash" sorts after 3.9 instead of before 3.2.
  */
 export function isOfferedFlashModel(displayName: string): boolean {
-  const generation = flashGeneration(displayName);
-  if (!generation) return false;
-  const [major, minor] = generation;
-  const [minMajor, minMinor] = MIN_FLASH_GENERATION;
+  const parsed = parseGeminiModelLabel(displayName);
+  if (!parsed) return false;
+  const minGen = MIN_FAMILY_GENERATIONS[parsed.family];
+  if (!minGen) return false;
+  const [major, minor] = parsed.generation;
+  const [minMajor, minMinor] = minGen;
   return major !== minMajor ? major > minMajor : minor >= minMinor;
 }
 
 /**
- * Fallback catalog, used only until the language server has been reached once.
- *
- * Seeded with 3.7 rather than the newer 3.8 on purpose: this list is what a
- * user sees before discovery has run, so it has to be a generation every
- * entitled account can actually serve, and 3.7 Flash is the one the backend
- * itself names in the #1519 error. Discovery adds 3.8 as soon as the server is
- * reachable.
+ * Fallback catalog, used when `agy models` (or the language server) cannot be
+ * reached during passive model enumeration.
  */
 export const SEED_GEMINI_MODELS: ReadonlyArray<{ key: string; displayName: string }> =
   Object.freeze([
-    { key: 'gemini-3.7-flash-high', displayName: 'Gemini 3.7 Flash (High)' },
-    { key: 'gemini-3.7-flash-low', displayName: 'Gemini 3.7 Flash (Low)' },
-    { key: 'gemini-3.7-flash-medium', displayName: 'Gemini 3.7 Flash (Medium)' },
+    { key: 'gemini-4-argon-high', displayName: 'Gemini 4 Argon (High)' },
+    { key: 'gemini-4-argon-medium', displayName: 'Gemini 4 Argon (Medium)' },
+    { key: 'gemini-4-argon-low', displayName: 'Gemini 4 Argon (Low)' },
+    { key: 'gemini-3.8-flash-high', displayName: 'Gemini 3.8 Flash (High)' },
+    { key: 'gemini-3.8-flash-medium', displayName: 'Gemini 3.8 Flash (Medium)' },
+    { key: 'gemini-3.8-flash-low', displayName: 'Gemini 3.8 Flash (Low)' },
   ]);
 
 /** Default model key for a new Gemini session. */
-export const DEFAULT_GEMINI_MODEL_KEY = 'gemini-3.7-flash-medium';
+export const DEFAULT_GEMINI_MODEL_KEY = 'gemini-3.8-flash-medium';
 
 /**
  * Strip the `antigravity-gemini-agent:` namespace off a stored model id.
@@ -134,15 +158,45 @@ export function selectGeminiModels(
 ): Array<{ key: string; displayName: string }> {
   const out: Array<{ key: string; displayName: string }> = [];
   for (const info of catalog.values()) {
-    if (info.apiProvider !== GOOGLE_API_PROVIDER) continue;
-    if (entitledEnums.size > 0 && !entitledEnums.has(info.enum)) continue;
-    // An unlabelled entry is an internal/experimental slot (the server returns
-    // several with no displayName). Nothing useful to show the user.
-    if (!info.displayName) continue;
-    if (!isOfferedFlashModel(info.displayName)) continue;
-    out.push({ key: info.key, displayName: info.displayName });
+    if (info.apiProvider && info.apiProvider !== GOOGLE_API_PROVIDER) continue;
+    if (!info.apiProvider && !info.key.toLowerCase().startsWith('gemini-')) continue;
+    const enumOrKey = info.enum ?? info.key;
+    if (entitledEnums.size > 0 && !entitledEnums.has(enumOrKey) && !entitledEnums.has(info.key)) {
+      continue;
+    }
+    const displayName = info.displayName || formatModelDisplayName(info.key);
+    if (!displayName) continue;
+    if (!isOfferedFlashModel(displayName)) continue;
+    out.push({ key: info.key, displayName });
   }
   return out.sort((a, b) => a.displayName.localeCompare(b.displayName));
+}
+
+/**
+ * Parse the tabular output of `agy models` and return Google-served Gemini
+ * entries (`gemini-*`). The CLI separates the id from the display name with a
+ * single tab (`gemini-4-argon-medium\tGemini 4 Argon (Medium)`); older notes
+ * showed two or more spaces, so both are accepted. A pattern that only took
+ * spaces parsed nothing on a real Windows install and fell back to the seed
+ * list on every read (#1653).
+ */
+export function parseAgyModelList(
+  output: string,
+): Array<{ key: string; displayName: string }> {
+  const seen = new Set<string>();
+  const out: Array<{ key: string; displayName: string }> = [];
+  for (const rawLine of output.split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (!line) continue;
+    const match = /^([a-z0-9][a-z0-9._-]*)(?:\t+| {2,})\s*(.+?)\s*$/i.exec(line);
+    if (!match) continue;
+    const [, key, displayName] = match;
+    if (!key.toLowerCase().startsWith('gemini-')) continue;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push({ key, displayName });
+  }
+  return out;
 }
 
 /** Read the account's entitled model enums out of a raw GetUserStatus payload. */

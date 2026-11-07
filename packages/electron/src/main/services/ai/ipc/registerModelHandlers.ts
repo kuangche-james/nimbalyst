@@ -5,7 +5,9 @@ import { getWindowIdForWindow, resolveActiveWorkspacePathForWindowId } from '../
 import { getAgentWorkflowService } from '../../AgentWorkflowService';
 import { safeSend } from '.././aiServiceUtils';
 import { claudeCliSessionSupportsPlugins } from '.././claudeCliLauncherSingleton';
-import { isModelEnabled, resolveProviderEnabled } from '.././modelEnablementFilter';
+import { getCachedHeadlessAgentAvailability } from '.././headlessAgentAvailability';
+import { dropStaleAllowLists, isModelEnabled, resolveProviderEnabled } from '.././modelEnablementFilter';
+import { logger } from '../../../utils/logger';
 import { type AIServiceContext } from './AIServiceContext';
 import { ModelRegistry, ProviderFactory } from '@nimbalyst/runtime/ai/server';
 import { type AIProviderType } from '@nimbalyst/runtime/ai/server/types';
@@ -270,9 +272,20 @@ export function registerModelHandlers(ctx: AIServiceContext): void {
 
     // Filter to only enabled models. The gate is extracted to a pure,
     // unit-tested function so the claude-code family (SDK + CLI) can't silently
-    // hide a shipped variant again (NIM-1486).
+    // hide a shipped variant again (NIM-1486). An allow-list left over from a
+    // catalog that no longer exists would hide the whole provider; it is
+    // ignored instead (#1653).
+    const { entries: effectiveEnablement, stale: staleAllowLists } = dropStaleAllowLists(
+      enabledProviders,
+      allModels,
+    );
+    if (staleAllowLists.length > 0) {
+      logger.ai.warn(
+        `[AIService] ai:getModels ignoring stale model allow-list(s) that match nothing in the current catalog: ${staleAllowLists.join(', ')}`,
+      );
+    }
     const enabledModels = allModels.filter(model =>
-      isModelEnabled(model, enabledProviders[model.provider as AIProviderType]),
+      isModelEnabled(model, effectiveEnablement[model.provider as AIProviderType]),
     );
 
     // Surface extension-contributed agent providers (aiAgentProviders) in the
@@ -298,6 +311,21 @@ export function registerModelHandlers(ctx: AIServiceContext): void {
           provider: agentEntry.contributionId as AIProviderType,
         });
       }
+    }
+
+    // One line per call, so a provider that silently vanishes from the picker
+    // (fetched but gated, or never fetched) can be diagnosed from main.log
+    // without a debug build. Gemini's enablement is decided by a detection
+    // probe rather than a stored flag, so its inputs are spelled out (#1653).
+    {
+      const fetched: Record<string, number> = {};
+      for (const model of allModels) fetched[model.provider] = (fetched[model.provider] ?? 0) + 1;
+      const shown: Record<string, number> = {};
+      for (const model of enabledModels) shown[model.provider] = (shown[model.provider] ?? 0) + 1;
+      const geminiAvailability = getCachedHeadlessAgentAvailability('antigravity-gemini-agent');
+      logger.ai.info(
+        `[AIService] ai:getModels enabled=${JSON.stringify([...enabledProviderSet])} fetched=${JSON.stringify(fetched)} shown=${JSON.stringify(shown)} gemini={stored:${JSON.stringify(providerSettings['antigravity-gemini-agent']?.enabled)},probeInstalled:${geminiAvailability.installed},probePath:${JSON.stringify(geminiAvailability.executablePath ?? null)},hidden:${JSON.stringify(providerSettings['antigravity-gemini-agent']?.hiddenModels ?? null)},allow:${JSON.stringify(providerSettings['antigravity-gemini-agent']?.models ?? null)}}`,
+      );
     }
 
     // Group ENABLED models by provider (not all models)

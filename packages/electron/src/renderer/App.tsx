@@ -1879,6 +1879,16 @@ export default function App() {
     return () => window.removeEventListener('nimbalyst:open-codex-auth-settings', handler);
   }, []);
 
+  // A transcript widget (PermissionModeRequiredWidget) asks for the project
+  // trust chooser when a headless CLI provider refused a turn over the
+  // permission mode. Same toast the shield menu's "Change permission mode"
+  // opens.
+  useEffect(() => {
+    const handler = () => setForceShowTrustToast(true);
+    window.addEventListener('nimbalyst:change-permission-mode', handler);
+    return () => window.removeEventListener('nimbalyst:change-permission-mode', handler);
+  }, []);
+
   // React to unified navigation back/forward commands. The IPC subscriptions
   // live in store/listeners/appCommandListeners.ts.
   const navigationGoBackVersion = useAtomValue(navigationGoBackRequestAtom);

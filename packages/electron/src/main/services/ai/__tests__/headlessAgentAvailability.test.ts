@@ -136,7 +136,7 @@ describe('resolveProviderEnabled for detected-default providers', () => {
   });
 
   describe('gemini, whose sign-in cannot be probed', () => {
-    const APP = '/Applications/Antigravity.app/Contents/Resources/bin/language_server';
+    const APP = '/Users/me/.local/bin/agy';
 
     it('reports signed in on presence alone', () => {
       // Not an assumption that the user IS signed in — a statement about what

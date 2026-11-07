@@ -18,7 +18,11 @@ import { BaseAgentProvider } from './BaseAgentProvider';
 import { scrubProviderApiKeys } from '../providerApiKeyScrub';
 import { buildUserMessageAddition } from './documentContextUtils';
 import { describeUnusableWorkspacePath } from './workspacePreconditions';
-import { buildClaudeCodeSystemPrompt } from '../../prompt';
+import {
+  buildClaudeCodeSystemPrompt,
+  buildMetaAgentSystemPrompt,
+  type MetaAgentWorkflowPreset,
+} from '../../prompt';
 import type {
   ProviderConfig,
   DocumentContext,
@@ -242,8 +246,15 @@ export abstract class HeadlessCliAgentProvider extends BaseAgentProvider {
       return;
     }
 
+    const agentRole = await this.getAgentRole(sessionId);
+    const isMetaAgent = agentRole === 'meta-agent';
+    const workflowPreset = isMetaAgent ? await this.getWorkflowPreset(sessionId) : 'default';
     const systemPrompt = this.buildSystemPrompt(
-      documentContext, await this.getSessionDirective(sessionId), this.isNamedOutOfBand(sessionId, documentContext),
+      documentContext,
+      await this.getSessionDirective(sessionId),
+      this.isNamedOutOfBand(sessionId, documentContext),
+      isMetaAgent,
+      workflowPreset,
     );
     const { userMessageAddition, messageWithContext } = buildUserMessageAddition(message, documentContext);
 
@@ -295,7 +306,7 @@ export abstract class HeadlessCliAgentProvider extends BaseAgentProvider {
       const mcpServers = await this.mcpConfigService.getMcpServersConfig({
         sessionId,
         workspacePath: documentContext?.mcpConfigWorkspacePath || workspacePath,
-        profile: 'standard',
+        profile: isMetaAgent ? 'meta-agent' : 'standard',
       });
 
       const existingSessionId = this.sessions.getSessionId(sessionId || '');
@@ -307,6 +318,7 @@ export abstract class HeadlessCliAgentProvider extends BaseAgentProvider {
         model: resolvedModel,
         systemPrompt,
         mcpServers,
+        ...(isMetaAgent ? { allowedTools: BaseAgentProvider.META_AGENT_ALLOWED_TOOLS } : {}),
         permissionMode: permission.permissionMode ?? undefined,
         raw: { permissionsPath: documentContext?.permissionsPath },
       };
@@ -331,6 +343,7 @@ export abstract class HeadlessCliAgentProvider extends BaseAgentProvider {
       };
 
       const transcriptAdapter = new AgentProtocolTranscriptAdapter(null, sessionId ?? '');
+      const pendingToolArgs = new Map<string, Record<string, unknown>>();
       transcriptAdapter.userMessage(
         prompt,
         documentContext?.mode === 'planning' ? 'planning' : 'agent',
@@ -346,6 +359,13 @@ export abstract class HeadlessCliAgentProvider extends BaseAgentProvider {
       })) {
         if (abortController.signal.aborted) {
           throw new Error('Operation cancelled');
+        }
+
+        if (sessionId && session.id && session.id !== existingSessionId) {
+          this.sessions.captureSessionId(sessionId, session.id);
+        }
+        if (session.appliedModel && this._initData) {
+          this._initData.model = session.appliedModel;
         }
 
         if (sessionId) {
@@ -372,8 +392,29 @@ export abstract class HeadlessCliAgentProvider extends BaseAgentProvider {
               yield { type: 'text', content: item.text };
               break;
             case 'tool_call':
+              if (item.toolCall.id && item.toolCall.arguments) {
+                pendingToolArgs.set(item.toolCall.id, item.toolCall.arguments);
+              }
               yield { type: 'tool_call', toolCall: item.toolCall };
               break;
+            case 'tool_result': {
+              const toolArgs = item.toolResult.id
+                ? pendingToolArgs.get(item.toolResult.id)
+                : undefined;
+              if (item.toolResult.id) {
+                pendingToolArgs.delete(item.toolResult.id);
+              }
+              yield {
+                type: 'tool_call',
+                toolCall: {
+                  id: item.toolResult.id,
+                  name: item.toolResult.name,
+                  ...(toolArgs ? { arguments: toolArgs } : {}),
+                  result: item.toolResult.result,
+                },
+              };
+              break;
+            }
             case 'complete':
               if (sessionId && fullText) {
                 await this.storeAssistantResponse(sessionId, fullText);
@@ -496,7 +537,16 @@ export abstract class HeadlessCliAgentProvider extends BaseAgentProvider {
     documentContext?: DocumentContext,
     sessionDirective?: string,
     hasOutOfBandNaming: boolean = false,
+    isMetaAgent: boolean = false,
+    workflowPreset: MetaAgentWorkflowPreset = 'default',
   ): string {
+    if (isMetaAgent) {
+      return buildMetaAgentSystemPrompt('codex', workflowPreset, {
+        provider: this.getProviderName(),
+        model: this.config?.model ?? undefined,
+        sessionDirective,
+      });
+    }
     return buildClaudeCodeSystemPrompt({
       hasSessionNaming: isInternalMcpServerEnabled(),
       hasOutOfBandNaming,
@@ -599,7 +649,7 @@ export abstract class HeadlessCliAgentProvider extends BaseAgentProvider {
 function readRawEventType(rawEvent: unknown): string {
   if (rawEvent && typeof rawEvent === 'object') {
     const record = rawEvent as Record<string, unknown>;
-    for (const key of ['type', 'method'] as const) {
+    for (const key of ['type', 'method', 'event'] as const) {
       const value = record[key];
       if (typeof value === 'string' && value.trim()) return value;
     }

@@ -69,7 +69,7 @@ Twelve built-in provider lanes, plus any agent an extension contributes. Every l
 - GitHub Copilot CLI (ACP)
 - Grok Build (ACP)
 - Cursor Agent
-- Gemini via Google Antigravity (Connect-RPC over the user's Antigravity login; reports no usage numbers, so context and cost display as unavailable rather than guessed)
+- Gemini via Google Antigravity (Antigravity CLI `agy` headless NDJSON stream over the user's Antigravity login, with multi-turn `--conversation` resumption, native tool execution, and token usage reporting)
 - OpenCode, with slash commands, Compact, agent roles, and a model picker populated from the user's connected accounts
 
 **Cross-provider behavior**

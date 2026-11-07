@@ -6,6 +6,7 @@ import { DiffViewer } from './DiffViewer';
 import { LoginRequiredWidget } from './LoginRequiredWidget';
 import { OpenAIAuthWidget } from './OpenAIAuthWidget';
 import { CodexAuthRequiredWidget } from './CodexAuthRequiredWidget';
+import { PermissionModeRequiredWidget, isPermissionModeRequiredError } from './PermissionModeRequiredWidget';
 import { ContextLimitWidget } from './ContextLimitWidget';
 import { classifyContextFailure, isCompactionFailureText } from './contextFailureDetection';
 import { RateLimitWidget } from './RateLimitWidget';
@@ -372,6 +373,14 @@ export const MessageSegment = React.memo(function MessageSegment({
     if (message.isCodexAuthRequired && shouldShowLoginWidget) {
       return <CodexAuthRequiredWidget fallbackMessage={errorMessage} />;
     }
+    // A headless CLI provider (Gemini via agy, Cursor Agent) refused the turn
+    // up front because the project's permission mode would require prompts
+    // the CLI cannot deliver. The fix is one click away, so offer it instead
+    // of a dead-end red row (#1653).
+    if (isPermissionModeRequiredError(errorMessage)) {
+      return <PermissionModeRequiredWidget message={errorMessage} workspacePath={workspacePath} />;
+    }
+
     if (message.isCodexAuthRequired && !shouldShowLoginWidget) {
       return null;
     }

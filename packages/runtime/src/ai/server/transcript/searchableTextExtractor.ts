@@ -389,6 +389,27 @@ function extractGeminiOutput(
   if (metadata?.role === 'tool') {
     return { searchableText: null, messageKind: 'tool' };
   }
+  if (metadata?.role === 'assistant') {
+    const trimmed = content.trim();
+    if (trimmed.length === 0) return { searchableText: null, messageKind: 'meta' };
+    return { searchableText: nonEmpty(content), messageKind: 'assistant' };
+  }
+  const parsed = safeJsonParse(content);
+  if (parsed && typeof parsed === 'object') {
+    const p = parsed as Record<string, unknown>;
+    if (p.type === 'item.completed') {
+      return extractCodexOutput(parsed, content);
+    }
+    if (typeof p.event === 'string') {
+      if (p.event === 'step_update') {
+        const step = p.step_update as { step_type?: unknown } | undefined;
+        if (step?.step_type === 'tool') {
+          return { searchableText: null, messageKind: 'tool' };
+        }
+      }
+      return { searchableText: null, messageKind: 'meta' };
+    }
+  }
   const trimmed = content.trim();
   if (trimmed.length === 0) return { searchableText: null, messageKind: 'meta' };
   return { searchableText: nonEmpty(content), messageKind: 'assistant' };

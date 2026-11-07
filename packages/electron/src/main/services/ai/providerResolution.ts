@@ -71,5 +71,5 @@ export function resolveExtensionAgentRef(provider: string): ExtensionAgentRef | 
  * contribution, resolved through the registry.
  */
 export function usesHostSuppliedToolLoop(provider: string): boolean {
-  return provider === 'antigravity-gemini-agent' || isExtensionAgentProvider(provider);
+  return isExtensionAgentProvider(provider);
 }
