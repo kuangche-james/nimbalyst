@@ -132,7 +132,11 @@ const DESCRIPTOR: HeadlessCliAgentDescriptor = {
     'Antigravity is not logged in. Run `agy` or open Antigravity to sign in to your Google account, then try again.',
   supportsToolPermissions: false,
   permissionModeMessage:
-    'Gemini via Antigravity CLI runs in headless --print mode, which executes tools without interactive prompts. Switch workspace permission mode to "Allow all" (or "Bypass all") to use Gemini in this workspace.',
+    'Gemini runs through the Antigravity CLI in headless mode, which carries out file edits '
+    + 'and shell commands without asking first, so there is no per-tool approval for '
+    + 'Nimbalyst to intercept. To use Gemini in this project, set its permission mode to '
+    + '"Allow edits only", "Agent-verified", or "Allow everything" (click the shield icon in '
+    + 'the session header, or open Project Settings > Permissions), then send the message again.',
 };
 
 export class GeminiAntigravityProvider extends HeadlessCliAgentProvider {
